@@ -1,0 +1,24 @@
+# Core dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+g4f>=0.3.0.0
+
+# HTTP/Async
+aiohttp>=3.8.0
+requests>=2.28.0
+httpx>=0.24.0
+
+# Database
+aiosqlite>=0.19.0
+
+# Scheduling
+apscheduler>=3.10.0
+
+# Optional: Token counting (may fail on ARM/Termux)
+tiktoken>=0.5.0
+
+# Optional: Better performance
+orjson>=3.9.0
+
+# Flask fallback (if FastAPI fails)
+flask>=2.3.0
