@@ -129,164 +129,127 @@ def _verify_key(auth_header: Optional[str]) -> bool:
 
 async def handle_chat_request(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Main request handler with Function Calling support.
+    Main handler — supports full tool calling cycle.
 
-    Flow:
-    1. Extract model, messages, tools, tool_choice, stream
-    2. If tools present → FC Emulator path
-    3. If no tools → Normal chat path
-    4. Route to provider
-    5. Parse response
-    6. Format and return
+    Cycle:
+    1. PicoClaw sends {messages, tools} → Bridge returns {tool_calls}
+    2. PicoClaw executes tool
+    3. PicoClaw sends {messages with role:"tool"} → Bridge returns {content}
     """
     model = body.get("model", config.g4f.default_model)
     messages = body.get("messages", [])
-    stream = body.get("stream", False)
     tools = body.get("tools", [])
     tool_choice = body.get("tool_choice", "auto")
+    stream = body.get("stream", False)
     temperature = body.get("temperature", 0.7)
     max_tokens = body.get("max_tokens", 4096)
 
     if not messages:
         return build_error("messages is required", "invalid_request_error")
 
-    # Get components
     emulator = get_emulator()
     tm = get_token_manager()
     router = get_router()
     fc_config = config.function_calling
 
-    # ── Detect Function Calling mode ──────────────────────
+    # ── Determine mode ────────────────────────────────────
     use_fc = fc_config.enabled and emulator.has_tools(body)
+    has_results = emulator.has_tool_results(messages)
 
-    if use_fc:
-        logger.info(
-            f"🔧 FC Mode: model={model} tools={len(tools)} "
-            f"choice={tool_choice}"
-        )
+    if has_results:
+        # STEP 3: Tool results → AI processes and gives final answer
+        logger.info("📥 Processing tool results")
+        prepared, mode = emulator.build_messages(messages, [], "auto")
+        mode = "result"
+        stream = False  # Need full response
 
-        # Disable streaming for FC (need full response for parsing)
-        if stream:
-            logger.debug("FC Mode: streaming disabled (need full response)")
-            stream = False
+    elif use_fc:
+        # STEP 1: Need tool_calls
+        logger.info(f"🔧 FC Mode: {len(tools)} tools")
+        prepared, mode = emulator.build_messages(messages, tools, tool_choice)
+        stream = False  # Need full response for JSON parsing
 
-        # Inject FC system prompt
-        enhanced_messages = emulator.build_enhanced_messages(
-            messages, tools, tool_choice
-        )
-
-        if fc_config.log_injected_prompt:
-            logger.debug(
-                f"Injected prompt:\n"
-                f"{enhanced_messages[0]['content'][:500]}..."
-            )
     else:
-        enhanced_messages = messages
-        logger.info(
-            f"💬 Chat Mode: model={model} stream={stream} "
-            f"msgs={len(messages)}"
-        )
+        # Normal chat
+        logger.info(f"💬 Chat: model={model} msgs={len(messages)}")
+        prepared = messages
+        mode = "chat"
 
-    # ── Prepare messages ──────────────────────────────────
-    prepared, session_id = tm.prepare_messages(enhanced_messages)
-    token_count = tm.count_tokens(prepared, model)
+    # ── Handle streaming (chat mode only) ─────────────────
+    if stream and mode == "chat":
+        return {
+            "__stream__": True, "router": router,
+            "model": model, "messages": prepared,
+            "temperature": temperature, "max_tokens": max_tokens,
+        }
 
-    # ── Route to provider ─────────────────────────────────
-    if stream and not use_fc:
-        # Streaming (non-FC only)
-        return {"__stream__": True, "router": router, "model": model,
-                "messages": prepared, "temperature": temperature,
-                "max_tokens": max_tokens}
+    # ── Prepare & route ───────────────────────────────────
+    prepared_final, _ = tm.prepare_messages(prepared)
+    token_count = tm.count_tokens(prepared_final, model)
 
-    # Non-streaming (or FC mode)
+    # Lower temperature for FC mode (more deterministic)
+    if mode == "fc":
+        temperature = min(temperature, 0.3)
+
     result = await router.route(
-        model=model, messages=prepared, stream=False,
+        model=model, messages=prepared_final, stream=False,
         temperature=temperature, max_tokens=max_tokens,
     )
 
     if not result.success:
-        # ── FC Retry with stronger prompt ─────────────────
-        if use_fc and fc_config.max_parse_retries > 0:
-            logger.info("FC: First attempt failed, retrying...")
-            result = await router.route(
-                model=model, messages=prepared, stream=False,
-                temperature=0.3,  # Lower temp for more deterministic
-                max_tokens=max_tokens,
-            )
+        return build_error(result.error or "All providers failed")
 
-        if not result.success:
-            return build_error(result.error or "All providers failed")
+    raw = str(result.response)
 
-    raw_response = str(result.response)
+    # ── Parse based on mode ───────────────────────────────
+    if mode in ("fc", "result"):
+        parsed = emulator.parse_response(raw, tools, mode)
 
-    # ── FC: Parse response for tool_calls ─────────────────
-    if use_fc:
-        parsed = emulator.parse_response(raw_response, tools)
-
-        # If parsing failed, retry with stronger prompt
+        # FC mode: retry if no tool_calls
         if (
-            parsed["type"] == "text"
-            and tool_choice in ("required", "auto")
+            mode == "fc"
+            and parsed["type"] == "text"
             and fc_config.max_parse_retries > 0
         ):
-            logger.warning("FC: No tool_calls found, retrying with emphasis")
+            logger.warning("🔄 FC retry: no tool_calls, trying harder")
 
-            # Add stronger emphasis
-            retry_messages = prepared.copy()
-            retry_messages.append({
+            retry_msgs = prepared_final.copy()
+            retry_msgs.append({
                 "role": "user",
-                "content": (
-                    "IMPORTANT: You MUST respond with a JSON object "
-                    "containing tool_calls. Do NOT respond with text. "
-                    "Output ONLY valid JSON."
-                ),
+                "content": "Respond with JSON only. Use the format: "
+                           '{"tool_calls":[{"name":"...","arguments":{...}}]}'
             })
 
             retry_result = await router.route(
-                model=model, messages=retry_messages, stream=False,
+                model=model, messages=retry_msgs, stream=False,
                 temperature=0.1, max_tokens=max_tokens,
             )
 
             if retry_result.success:
                 parsed = emulator.parse_response(
-                    str(retry_result.response), tools
+                    str(retry_result.response), tools, mode
                 )
 
-        # Build OpenAI response
-        if parsed["type"] == "tool_calls" and parsed["tool_calls"]:
-            response = emulator.build_openai_response(
-                parsed, model,
-                token_count.prompt_tokens,
-            )
+        # Build response
+        response = emulator.build_response(
+            parsed, model, token_count.prompt_tokens
+        )
+
+        if parsed["type"] == "tool_calls":
             logger.info(
-                f"✅ FC Response: {len(parsed['tool_calls'])} tool_call(s) "
+                f"✅ {len(parsed['tool_calls'])} tool_call(s) "
                 f"via {result.provider_name}"
             )
-            return response
-
-        elif fc_config.fallback_to_text:
-            # No tool_calls found, return as text
-            content = parsed.get("content") or raw_response
-            logger.warning(
-                f"⚠️ FC Fallback: returning text response "
-                f"({len(content)} chars)"
-            )
-            return build_completion(
-                content, model, token_count.prompt_tokens,
-            )
+        elif mode == "result":
+            logger.info(f"✅ Final answer via {result.provider_name}")
         else:
-            return build_error(
-                "Failed to extract function calls from AI response",
-                "function_calling_error",
-            )
+            logger.warning("⚠️ FC fallback to text")
+
+        return response
 
     # ── Normal chat response ──────────────────────────────
-    comp_tokens = tm.counter.count_text(raw_response)
-    return build_completion(
-        raw_response, model,
-        token_count.prompt_tokens, comp_tokens,
-    )
-
+    comp_tokens = tm.counter.count_text(raw)
+    return build_completion(raw, model, token_count.prompt_tokens, comp_tokens)
 
 # ═══════════════════════════════════════════════════════════════
 # Server Setup

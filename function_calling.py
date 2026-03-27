@@ -1,17 +1,6 @@
 """
-Function Calling Emulator for g4f-Bridge.
-
-Emulates OpenAI Function Calling for free providers that don't
-support it natively. Uses prompt engineering + regex parsing to
-convert text responses into structured tool_calls.
-
-Flow:
-  1. Detect tools in request
-  2. Inject hidden system prompt forcing JSON output
-  3. Send to g4f provider
-  4. Parse raw text response → extract JSON
-  5. Normalize to OpenAI tool_calls format
-  6. Return to PicoClaw
+Function Calling Emulator v2 — Simplified & Robust.
+Handles full tool calling cycle including tool results.
 """
 
 import re
@@ -23,232 +12,391 @@ from logger_setup import get_logger
 
 
 class JSONExtractor:
-    """
-    Extracts JSON objects from mixed text responses.
-
-    Handles multiple formats:
-    - Pure JSON
-    - JSON in markdown code blocks (```json ... ```)
-    - JSON mixed with explanatory text
-    - Multiple JSON objects in one response
-    """
+    """Extract JSON from messy AI responses."""
 
     @staticmethod
-    def extract_all(text: str) -> List[Dict[str, Any]]:
-        """
-        Extract all valid JSON objects from text.
-        Tries multiple strategies in order of reliability.
-
-        Args:
-            text: Raw text response from AI
-
-        Returns:
-            List of parsed JSON objects
-        """
+    def extract(text: str) -> Optional[Dict[str, Any]]:
+        """Extract first valid JSON object from text."""
         if not text or not text.strip():
-            return []
+            return None
 
-        results = []
+        text = text.strip()
 
-        # Strategy 1: Entire text is valid JSON
+        # Strategy 1: Whole text is JSON
         try:
-            parsed = json.loads(text.strip())
+            parsed = json.loads(text)
             if isinstance(parsed, dict):
-                return [parsed]
-            if isinstance(parsed, list):
-                return [item for item in parsed if isinstance(item, dict)]
+                return parsed
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Strategy 2: JSON in markdown code blocks
-        code_block_results = JSONExtractor._from_code_blocks(text)
-        if code_block_results:
-            return code_block_results
-
-        # Strategy 3: Bracket-matching extraction
-        bracket_results = JSONExtractor._by_bracket_matching(text)
-        if bracket_results:
-            return bracket_results
-
-        return results
-
-    @staticmethod
-    def _from_code_blocks(text: str) -> List[Dict[str, Any]]:
-        """Extract JSON from markdown code blocks."""
-        results = []
-
-        # Match ```json ... ``` or ``` ... ```
-        patterns = [
-            r'```json\s*([\s\S]*?)\s*```',
-            r'```\s*([\s\S]*?)\s*```',
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.DOTALL)
-            for match in matches:
+        # Strategy 2: JSON in code blocks
+        for pattern in [r'```json\s*([\s\S]*?)\s*```', r'```\s*([\s\S]*?)\s*```']:
+            match = re.search(pattern, text)
+            if match:
                 try:
-                    parsed = json.loads(match.strip())
+                    parsed = json.loads(match.group(1).strip())
                     if isinstance(parsed, dict):
-                        results.append(parsed)
-                    elif isinstance(parsed, list):
-                        results.extend(
-                            item for item in parsed
-                            if isinstance(item, dict)
-                        )
+                        return parsed
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-            if results:
-                return results
-
-        return results
-
-    @staticmethod
-    def _by_bracket_matching(text: str) -> List[Dict[str, Any]]:
-        """Extract JSON objects using bracket depth tracking."""
-        results = []
-        i = 0
-        n = len(text)
-
-        while i < n:
-            if text[i] == '{':
-                depth = 0
-                start = i
-                in_string = False
-                escape_next = False
-
-                while i < n:
-                    char = text[i]
-
-                    if escape_next:
-                        escape_next = False
-                        i += 1
-                        continue
-
-                    if char == '\\' and in_string:
-                        escape_next = True
-                        i += 1
-                        continue
-
-                    if char == '"' and not escape_next:
-                        in_string = not in_string
-
-                    if not in_string:
-                        if char == '{':
-                            depth += 1
-                        elif char == '}':
-                            depth -= 1
-                            if depth == 0:
-                                candidate = text[start:i + 1]
-                                try:
-                                    parsed = json.loads(candidate)
-                                    if isinstance(parsed, dict):
-                                        results.append(parsed)
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
-                                break
-
-                    i += 1
-            i += 1
-
-        return results
-
-    @staticmethod
-    def extract_best(text: str, prefer_key: str = "tool_calls") -> Optional[Dict[str, Any]]:
-        """
-        Extract the best JSON object, preferring one with a specific key.
-
-        Args:
-            text: Raw text
-            prefer_key: Preferred key to look for
-
-        Returns:
-            Best matching JSON object, or None
-        """
-        all_json = JSONExtractor.extract_all(text)
-
-        if not all_json:
+        # Strategy 3: Find {...} with bracket matching
+        start = text.find('{')
+        if start == -1:
             return None
 
-        # Prefer objects with the target key
-        for obj in all_json:
-            if prefer_key in obj:
-                return obj
+        depth = 0
+        in_string = False
+        escape = False
+        i = start
 
-        # Prefer objects with 'name' (likely a tool call)
-        for obj in all_json:
-            if "name" in obj and "arguments" in obj:
-                return obj
+        while i < len(text):
+            c = text[i]
 
-        # Prefer objects with 'function' key
-        for obj in all_json:
-            if "function" in obj or "function_call" in obj:
-                return obj
+            if escape:
+                escape = False
+                i += 1
+                continue
 
-        # Return first object
-        return all_json[0] if all_json else None
+            if c == '\\' and in_string:
+                escape = True
+                i += 1
+                continue
+
+            if c == '"':
+                in_string = not in_string
+            elif not in_string:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start:i + 1])
+                        except (json.JSONDecodeError, ValueError):
+                            # Try next { in text
+                            next_start = text.find('{', start + 1)
+                            if next_start != -1:
+                                start = next_start
+                                depth = 0
+                                i = start
+                                continue
+                            return None
+            i += 1
+
+        return None
 
 
-class ToolCallNormalizer:
+class FunctionCallingEmulator:
     """
-    Normalizes various tool call formats to OpenAI standard.
-
-    Handles:
-    - {"action":"tool_call","tool_calls":[...]}  (our prompted format)
-    - {"tool_calls":[{"function":{"name":"...", "arguments":"..."}}]}  (OpenAI)
-    - {"name":"...", "arguments":{...}}  (simple format)
-    - {"function_call":{"name":"...", "arguments":"..."}}  (legacy OpenAI)
-    - [{"name":"...", "arguments":{...}}]  (array format)
+    Handles full FC lifecycle:
+    1. Detect if request needs FC
+    2. Detect if request contains tool results
+    3. Inject appropriate prompt
+    4. Parse response
+    5. Format output
     """
 
-    @staticmethod
-    def normalize(
-        parsed: Dict[str, Any],
-        available_tools: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    # SHORT prompt — AI lebih patuh dengan instruksi pendek
+    FC_PROMPT = """You are a function-calling AI. Respond ONLY with valid JSON.
+
+Functions:
+{tools}
+
+To call a function:
+{{"tool_calls":[{{"name":"FUNCTION_NAME","arguments":{{PARAMS}}}}]}}
+
+To reply normally:
+{{"content":"your reply"}}
+
+RULES:
+- Output ONLY JSON, nothing else
+- NO markdown, NO explanation, NO backticks
+- Pick ONE most relevant function
+- Use EXACT function names"""
+
+    def __init__(self) -> None:
+        self.logger = get_logger("function_calling")
+
+    # ── Detection ─────────────────────────────────────────
+
+    def has_tools(self, body: Dict[str, Any]) -> bool:
+        """Check if request contains tools."""
+        tools = body.get("tools")
+        if not tools:
+            return False
+        if body.get("tool_choice") == "none":
+            return False
+        return True
+
+    def has_tool_results(self, messages: List[Dict[str, str]]) -> bool:
         """
-        Normalize parsed JSON to OpenAI tool_calls format.
+        Check if messages contain tool results (Step 3).
+        This means PicoClaw already executed a tool and is
+        sending the result back for AI to process.
+        """
+        for msg in messages:
+            if msg.get("role") == "tool":
+                return True
+        return False
+
+    def has_pending_tool_calls(self, messages: List[Dict[str, str]]) -> bool:
+        """Check if last assistant message has tool_calls."""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                if msg.get("tool_calls"):
+                    return True
+                break
+        return False
+
+    # ── Message Building ──────────────────────────────────
+
+    def build_messages(
+        self,
+        messages: List[Dict[str, str]],
+        tools: List[Dict[str, Any]],
+        tool_choice: Any = "auto",
+    ) -> Tuple[List[Dict[str, str]], str]:
+        """
+        Build messages based on conversation state.
 
         Returns:
-            List of normalized tool_call objects:
-            [
-                {
-                    "id": "call_xxxxx",
-                    "type": "function",
-                    "function": {
-                        "name": "function_name",
-                        "arguments": "{\"param\": \"value\"}"  # STRING
-                    }
-                }
-            ]
+            (modified_messages, mode)
+            mode: "fc" = expecting tool_calls
+                  "result" = processing tool results
+                  "chat" = normal chat
         """
-        tool_names = {
-            t["function"]["name"]
-            for t in available_tools
-            if "function" in t and "name" in t["function"]
-        }
+        # ── Case 1: Tool results present ──────────────────
+        # PicoClaw executed tool, sending result back
+        # DO NOT inject FC prompt — AI should read result and respond
+        if self.has_tool_results(messages):
+            self.logger.info("📥 Tool result detected — forwarding to AI")
 
-        raw_calls = ToolCallNormalizer._extract_raw_calls(parsed)
+            # Clean messages for g4f compatibility
+            cleaned = self._clean_tool_messages(messages)
+            return cleaned, "result"
 
-        normalized = []
+        # ── Case 2: Tools requested, need FC ──────────────
+        if tools:
+            self.logger.info(f"🔧 FC Mode: {len(tools)} tools")
+
+            # Build compact tool list
+            tool_str = self._format_tools_compact(tools)
+
+            # Build FC prompt
+            fc_prompt = self.FC_PROMPT.format(tools=tool_str)
+
+            # Force specific tool if requested
+            if tool_choice == "required":
+                fc_prompt += "\nYou MUST call a function. Text-only response is FORBIDDEN."
+            elif isinstance(tool_choice, dict):
+                fname = tool_choice.get("function", {}).get("name", "")
+                if fname:
+                    fc_prompt += f"\nYou MUST call: {fname}"
+
+            # Build message list
+            enhanced = [{"role": "system", "content": fc_prompt}]
+
+            for msg in messages:
+                if msg.get("role") == "system":
+                    # Merge original system prompt (keep short)
+                    original = msg.get("content", "")
+                    if original and len(original) < 500:
+                        enhanced[0]["content"] += f"\n\nContext: {original}"
+                else:
+                    enhanced.append(msg.copy())
+
+            return enhanced, "fc"
+
+        # ── Case 3: Normal chat ───────────────────────────
+        return messages, "chat"
+
+    def _clean_tool_messages(
+        self, messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Clean tool-related messages for g4f compatibility.
+        g4f providers don't understand role:"tool", so convert it.
+        """
+        cleaned = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+
+            if role == "tool":
+                # Convert tool result to user message
+                tool_call_id = msg.get("tool_call_id", "")
+                content = msg.get("content", "")
+                cleaned.append({
+                    "role": "user",
+                    "content": (
+                        f"[Tool Result for {tool_call_id}]:\n{content}\n\n"
+                        f"Based on this tool result, provide your response."
+                    ),
+                })
+
+            elif role == "assistant" and msg.get("tool_calls"):
+                # Convert assistant tool_calls to text
+                calls = msg.get("tool_calls", [])
+                call_desc = []
+                for tc in calls:
+                    func = tc.get("function", {})
+                    name = func.get("name", "?")
+                    args = func.get("arguments", "{}")
+                    call_desc.append(f"Called {name}({args})")
+
+                cleaned.append({
+                    "role": "assistant",
+                    "content": "I called: " + ", ".join(call_desc),
+                })
+
+            else:
+                cleaned.append(msg.copy())
+
+        return cleaned
+
+    def _format_tools_compact(
+        self, tools: List[Dict[str, Any]]
+    ) -> str:
+        """Format tools as compact list."""
+        lines = []
+        for tool in tools:
+            func = tool.get("function", {})
+            name = func.get("name", "unknown")
+            desc = func.get("description", "")[:60]
+            params = func.get("parameters", {})
+            required = params.get("required", [])
+
+            if required:
+                params_str = ", ".join(required)
+                lines.append(f"• {name}({params_str}) — {desc}")
+            else:
+                # Show all properties briefly
+                props = list(params.get("properties", {}).keys())[:3]
+                params_str = ", ".join(props) if props else ""
+                lines.append(f"• {name}({params_str}) — {desc}")
+
+        return "\n".join(lines)
+
+    # ── Response Parsing ──────────────────────────────────
+
+    def parse_response(
+        self,
+        raw: str,
+        tools: List[Dict[str, Any]],
+        mode: str,
+    ) -> Dict[str, Any]:
+        """
+        Parse AI response based on mode.
+
+        Args:
+            raw: Raw text from provider
+            tools: Available tools
+            mode: "fc", "result", or "chat"
+
+        Returns:
+            {
+                "type": "tool_calls" | "text",
+                "tool_calls": [...] | None,
+                "content": "..." | None
+            }
+        """
+        if not raw or not raw.strip():
+            return {"type": "text", "tool_calls": None, "content": ""}
+
+        # For "result" and "chat" mode — just return text
+        if mode in ("result", "chat"):
+            # Still try to extract content from JSON if present
+            parsed = JSONExtractor.extract(raw)
+            if parsed and "content" in parsed:
+                return {
+                    "type": "text",
+                    "tool_calls": None,
+                    "content": str(parsed["content"]),
+                }
+            return {"type": "text", "tool_calls": None, "content": raw}
+
+        # For "fc" mode — try to extract tool_calls
+        parsed = JSONExtractor.extract(raw)
+
+        if parsed:
+            # Check for content-only response
+            if "content" in parsed and "tool_calls" not in parsed:
+                return {
+                    "type": "text",
+                    "tool_calls": None,
+                    "content": str(parsed["content"]),
+                }
+
+            # Extract tool_calls
+            tool_calls = self._normalize_tool_calls(parsed, tools)
+            if tool_calls:
+                names = [tc["function"]["name"] for tc in tool_calls]
+                self.logger.info(f"✅ Extracted: {', '.join(names)}")
+                return {
+                    "type": "tool_calls",
+                    "tool_calls": tool_calls,
+                    "content": None,
+                }
+
+        # Failed to parse
+        self.logger.warning("❌ No tool_calls found in response")
+        return {"type": "text", "tool_calls": None, "content": raw}
+
+    def _normalize_tool_calls(
+        self,
+        parsed: Dict[str, Any],
+        tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize various formats to OpenAI tool_calls."""
+        tool_names = set()
+        for t in tools:
+            func = t.get("function", {})
+            if "name" in func:
+                tool_names.add(func["name"])
+
+        # Find raw calls
+        raw_calls = []
+
+        if "tool_calls" in parsed:
+            tc = parsed["tool_calls"]
+            raw_calls = tc if isinstance(tc, list) else [tc]
+        elif "function_call" in parsed:
+            raw_calls = [parsed["function_call"]]
+        elif "name" in parsed and ("arguments" in parsed or "parameters" in parsed):
+            raw_calls = [parsed]
+        elif "function" in parsed and isinstance(parsed["function"], dict):
+            raw_calls = [parsed]
+
+        if not raw_calls:
+            return []
+
+        # Normalize each call
+        result = []
         for raw in raw_calls:
-            name, arguments = ToolCallNormalizer._extract_name_args(raw)
+            name = None
+            arguments = {}
+
+            if "function" in raw and isinstance(raw["function"], dict):
+                name = raw["function"].get("name")
+                arguments = raw["function"].get("arguments", {})
+            else:
+                name = raw.get("name", raw.get("function_name"))
+                arguments = raw.get("arguments", raw.get("parameters", raw.get("params", {})))
 
             if not name:
                 continue
 
-            # Fuzzy match tool name
-            matched_name = ToolCallNormalizer._match_tool_name(
-                name, tool_names
-            )
-            if not matched_name:
+            # Match tool name
+            matched = self._match_name(name, tool_names)
+            if not matched:
                 continue
 
-            # Ensure arguments is a JSON string
+            # Ensure arguments is string
             if isinstance(arguments, dict):
                 args_str = json.dumps(arguments, ensure_ascii=False)
             elif isinstance(arguments, str):
-                # Validate it's valid JSON
                 try:
                     json.loads(arguments)
                     args_str = arguments
@@ -257,506 +405,62 @@ class ToolCallNormalizer:
             else:
                 args_str = "{}"
 
-            normalized.append({
+            result.append({
                 "id": f"call_{uuid.uuid4().hex[:12]}",
                 "type": "function",
-                "function": {
-                    "name": matched_name,
-                    "arguments": args_str,
-                },
+                "function": {"name": matched, "arguments": args_str},
             })
 
-        return normalized
+        return result
 
     @staticmethod
-    def _extract_raw_calls(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract raw tool call objects from various formats."""
-        # Format: {"action":"tool_call", "tool_calls":[...]}
-        if "tool_calls" in parsed:
-            calls = parsed["tool_calls"]
-            if isinstance(calls, list):
-                return calls
-            if isinstance(calls, dict):
-                return [calls]
-
-        # Format: {"function_call": {...}}
-        if "function_call" in parsed:
-            return [parsed["function_call"]]
-
-        # Format: {"name":"...", "arguments":{...}} (direct tool call)
-        if "name" in parsed and ("arguments" in parsed or "parameters" in parsed):
-            return [parsed]
-
-        # Format: {"function": {"name":"...", "arguments":"..."}}
-        if "function" in parsed and isinstance(parsed["function"], dict):
-            return [parsed]
-
-        return []
-
-    @staticmethod
-    def _extract_name_args(raw: Dict[str, Any]) -> Tuple[Optional[str], Any]:
-        """Extract function name and arguments from a raw call."""
-        name = None
-        arguments = {}
-
-        # Nested: {"function": {"name": "...", "arguments": ...}}
-        if "function" in raw and isinstance(raw["function"], dict):
-            func = raw["function"]
-            name = func.get("name")
-            arguments = func.get("arguments", func.get("parameters", {}))
-        else:
-            # Flat: {"name": "...", "arguments": ...}
-            name = raw.get("name", raw.get("function_name"))
-            arguments = raw.get(
-                "arguments",
-                raw.get("parameters", raw.get("params", {})),
-            )
-
-        return name, arguments
-
-    @staticmethod
-    def _match_tool_name(
-        candidate: str, available: set
-    ) -> Optional[str]:
-        """Fuzzy match tool name against available tools."""
-        if not candidate:
-            return None
-
-        # Exact match
+    def _match_name(candidate: str, available: set) -> Optional[str]:
+        """Fuzzy match tool name."""
         if candidate in available:
             return candidate
 
-        # Case-insensitive match
-        candidate_lower = candidate.lower().strip()
-        for tool_name in available:
-            if tool_name.lower() == candidate_lower:
-                return tool_name
+        cl = candidate.lower().strip()
+        for name in available:
+            if name.lower() == cl:
+                return name
 
-        # Partial match (e.g., "search" matches "web_search")
-        for tool_name in available:
-            if candidate_lower in tool_name.lower():
-                return tool_name
-            if tool_name.lower() in candidate_lower:
-                return tool_name
+        # Partial match
+        for name in available:
+            if cl in name.lower() or name.lower() in cl:
+                return name
 
-        # Replace spaces/hyphens with underscores
-        normalized = candidate_lower.replace(" ", "_").replace("-", "_")
-        for tool_name in available:
-            if tool_name.lower().replace(" ", "_").replace("-", "_") == normalized:
-                return tool_name
+        # Underscore/hyphen normalization
+        cn = cl.replace(" ", "_").replace("-", "_")
+        for name in available:
+            if name.lower().replace(" ", "_").replace("-", "_") == cn:
+                return name
 
         return None
 
+    # ── Response Building ─────────────────────────────────
 
-class FunctionCallingEmulator:
-    """
-    Main emulator class.
-
-    Handles the full lifecycle:
-    1. Detect tools in request
-    2. Build enhanced system prompt
-    3. Parse response
-    4. Format as OpenAI tool_calls
-    """
-
-    # System prompt template for forcing JSON output
-    SYSTEM_PROMPT_TEMPLATE = """You are a function-calling AI assistant. You MUST respond ONLY with valid JSON.
-
-## Available Functions:
-{tool_definitions}
-
-## Response Format:
-
-When you need to call a function, respond with EXACTLY this JSON structure:
-{{"tool_calls": [{{"name": "<function_name>", "arguments": {{<parameters>}}}}]}}
-
-When NO function is needed (normal conversation), respond with:
-{{"content": "<your text response>"}}
-
-## Examples:
-
-User: "Search for weather in Tokyo"
-{{"tool_calls": [{{"name": "web_search", "arguments": {{"query": "weather in Tokyo"}}}}]}}
-
-User: "Hello, how are you?"
-{{"content": "Hello! I'm doing well. How can I help you?"}}
-
-User: "Read the file config.json"
-{{"tool_calls": [{{"name": "read_file", "arguments": {{"path": "config.json"}}}}]}}
-
-## ABSOLUTE RULES — VIOLATION CAUSES SYSTEM CRASH:
-1. Output ONLY the JSON object — NO text before or after
-2. NO markdown, NO code blocks, NO backticks, NO explanations
-3. Function names must EXACTLY match the list above
-4. Include ALL required parameters
-5. The JSON must be parseable by json.loads()
-{extra_rules}"""
-
-    FORCE_TOOL_RULE = """6. You MUST call at least one function — "content" only response is FORBIDDEN
-7. Analyze the user's request and determine which function best serves it"""
-
-    FORCE_SPECIFIC_TOOL_RULE = """6. You MUST call the function: {tool_name}
-7. DO NOT use any other function"""
-
-    def __init__(self) -> None:
-        """Initialize emulator."""
-        self.logger = get_logger("function_calling")
-        self.extractor = JSONExtractor()
-        self.normalizer = ToolCallNormalizer()
-
-    def has_tools(self, request_body: Dict[str, Any]) -> bool:
-        """Check if request contains tools."""
-        tools = request_body.get("tools", [])
-        tool_choice = request_body.get("tool_choice", "auto")
-
-        # No tools field at all
-        if not tools:
-            return False
-
-        # tool_choice is explicitly "none"
-        if tool_choice == "none":
-            return False
-
-        return True
-
-    def build_enhanced_messages(
-        self,
-        messages: List[Dict[str, str]],
-        tools: List[Dict[str, Any]],
-        tool_choice: Any = "auto",
-    ) -> List[Dict[str, str]]:
-        """
-        Build messages with injected system prompt for function calling.
-
-        Args:
-            messages: Original messages from PicoClaw
-            tools: Tool definitions
-            tool_choice: "auto", "required", "none", or specific tool
-
-        Returns:
-            Modified messages with injected system prompt
-        """
-        # Build tool definitions string
-        tool_defs = self._format_tool_definitions(tools)
-
-        # Determine extra rules based on tool_choice
-        extra_rules = ""
-        if tool_choice == "required":
-            extra_rules = self.FORCE_TOOL_RULE
-        elif isinstance(tool_choice, dict):
-            # Specific tool forced
-            func_info = tool_choice.get("function", {})
-            tool_name = func_info.get("name", "")
-            if tool_name:
-                extra_rules = self.FORCE_SPECIFIC_TOOL_RULE.format(
-                    tool_name=tool_name
-                )
-
-        # Build system prompt
-        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
-            tool_definitions=tool_defs,
-            extra_rules=extra_rules,
-        )
-
-        # Clone messages
-        enhanced = []
-
-        # Insert FC system prompt as FIRST message
-        enhanced.append({
-            "role": "system",
-            "content": system_prompt,
-        })
-
-        # Add original messages (merge existing system prompts)
-        for msg in messages:
-            if msg.get("role") == "system":
-                # Append original system content to our prompt
-                enhanced[0]["content"] += (
-                    "\n\n## Additional Context:\n" + msg.get("content", "")
-                )
-            else:
-                enhanced.append(msg.copy())
-
-        self.logger.debug(
-            f"Injected FC prompt with {len(tools)} tools "
-            f"(tool_choice={tool_choice})"
-        )
-
-        return enhanced
-
-    def parse_response(
-        self,
-        raw_response: str,
-        tools: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """
-        Parse AI response and extract tool_calls or content.
-
-        Args:
-            raw_response: Raw text from g4f provider
-            tools: Original tool definitions (for validation)
-
-        Returns:
-            {
-                "type": "tool_calls" | "text" | "error",
-                "tool_calls": [...] | None,
-                "content": "..." | None,
-                "raw": "original response"
-            }
-        """
-        if not raw_response or not raw_response.strip():
-            return {
-                "type": "error",
-                "tool_calls": None,
-                "content": "Empty response from provider",
-                "raw": raw_response,
-            }
-
-        text = raw_response.strip()
-
-        # Try to extract JSON
-        parsed = self.extractor.extract_best(text, prefer_key="tool_calls")
-
-        if parsed:
-            # Check if it's a text-only response
-            if "content" in parsed and "tool_calls" not in parsed:
-                content = parsed.get("content", "")
-                if isinstance(content, str) and content:
-                    return {
-                        "type": "text",
-                        "tool_calls": None,
-                        "content": content,
-                        "raw": raw_response,
-                    }
-
-            # Check for action field
-            action = parsed.get("action", "")
-            if action == "text" and "content" in parsed:
-                return {
-                    "type": "text",
-                    "tool_calls": None,
-                    "content": parsed["content"],
-                    "raw": raw_response,
-                }
-
-            # Try to normalize tool_calls
-            normalized = self.normalizer.normalize(parsed, tools)
-
-            if normalized:
-                self.logger.info(
-                    f"Extracted {len(normalized)} tool_call(s): "
-                    + ", ".join(tc["function"]["name"] for tc in normalized)
-                )
-                return {
-                    "type": "tool_calls",
-                    "tool_calls": normalized,
-                    "content": None,
-                    "raw": raw_response,
-                }
-
-        # Check if multiple JSON objects (multiple tool calls)
-        all_json = self.extractor.extract_all(text)
-        if all_json:
-            all_normalized = []
-            for obj in all_json:
-                norm = self.normalizer.normalize(obj, tools)
-                all_normalized.extend(norm)
-
-            if all_normalized:
-                self.logger.info(
-                    f"Extracted {len(all_normalized)} tool_call(s) "
-                    f"from {len(all_json)} JSON objects"
-                )
-                return {
-                    "type": "tool_calls",
-                    "tool_calls": all_normalized,
-                    "content": None,
-                    "raw": raw_response,
-                }
-
-        # Fallback: No valid JSON found → return as text
-        self.logger.warning(
-            "No valid tool_calls found in response, "
-            "returning as text"
-        )
-        return {
-            "type": "text",
-            "tool_calls": None,
-            "content": text,
-            "raw": raw_response,
-        }
-
-    def build_openai_response(
+    def build_response(
         self,
         parsed: Dict[str, Any],
         model: str,
         prompt_tokens: int = 0,
-        completion_tokens: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Build OpenAI-compatible response.
-
-        Args:
-            parsed: Result from parse_response()
-            model: Model name
-            prompt_tokens: Prompt token count
-            completion_tokens: Completion token count
-
-        Returns:
-            OpenAI-format response dict
-        """
+        """Build OpenAI-format response."""
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
 
         if parsed["type"] == "tool_calls" and parsed["tool_calls"]:
-            # Tool calls response
             message = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": parsed["tool_calls"],
             }
             finish_reason = "tool_calls"
+            comp_tokens = len(json.dumps(parsed["tool_calls"])) // 4
         else:
-            # Text response
-            content = parsed.get("content") or parsed.get("raw", "")
+            content = parsed.get("content") or ""
             message = {
                 "role": "assistant",
                 "content": content,
             }
             finish_reason = "stop"
-
-        if completion_tokens == 0:
-            content_for_count = (
-                json.dumps(parsed.get("tool_calls", ""))
-                if parsed["type"] == "tool_calls"
-                else (parsed.get("content") or "")
-            )
-            completion_tokens = max(1, len(content_for_count) // 4)
-
-        return {
-            "id": response_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finish_reason,
-                }
-            ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-        }
-
-    def _format_tool_definitions(
-        self, tools: List[Dict[str, Any]]
-    ) -> str:
-        """Format tool definitions for system prompt."""
-        lines = []
-        for i, tool in enumerate(tools, 1):
-            func = tool.get("function", {})
-            name = func.get("name", "unknown")
-            desc = func.get("description", "No description")
-            params = func.get("parameters", {})
-
-            lines.append(f"{i}. **{name}**: {desc}")
-
-            # List parameters
-            properties = params.get("properties", {})
-            required = params.get("required", [])
-
-            if properties:
-                lines.append("   Parameters:")
-                for param_name, param_info in properties.items():
-                    param_type = param_info.get("type", "string")
-                    param_desc = param_info.get("description", "")
-                    req_marker = " (REQUIRED)" if param_name in required else ""
-                    lines.append(
-                        f"   - {param_name} ({param_type}){req_marker}: {param_desc}"
-                    )
-
-            lines.append("")
-
-        return "\n".join(lines)
-
-
-# Global instance
-_emulator: Optional[FunctionCallingEmulator] = None
-
-
-def get_emulator() -> FunctionCallingEmulator:
-    """Get global emulator instance."""
-    global _emulator
-    if _emulator is None:
-        _emulator = FunctionCallingEmulator()
-    return _emulator
-
-
-# =============================================================================
-# Self-test
-# =============================================================================
-
-if __name__ == "__main__":
-    emulator = FunctionCallingEmulator()
-
-    # Test tools
-    test_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query",
-                        }
-                    },
-                    "required": ["query"],
-                },
-            },
-        }
-    ]
-
-    # Test 1: Pure JSON response
-    print("=== Test 1: Pure JSON ===")
-    r1 = emulator.parse_response(
-        '{"tool_calls": [{"name": "web_search", "arguments": {"query": "weather"}}]}',
-        test_tools,
-    )
-    print(f"Type: {r1['type']}, Calls: {r1['tool_calls']}")
-
-    # Test 2: JSON in markdown
-    print("\n=== Test 2: Markdown JSON ===")
-    r2 = emulator.parse_response(
-        'Sure! Let me search.\n```json\n{"tool_calls": [{"name": "web_search", "arguments": {"query": "weather"}}]}\n```',
-        test_tools,
-    )
-    print(f"Type: {r2['type']}, Calls: {r2['tool_calls']}")
-
-    # Test 3: Chatty response with embedded JSON
-    print("\n=== Test 3: Mixed text + JSON ===")
-    r3 = emulator.parse_response(
-        'I\'ll search for that. {"name": "web_search", "arguments": {"query": "Tokyo weather"}} Let me get results.',
-        test_tools,
-    )
-    print(f"Type: {r3['type']}, Calls: {r3['tool_calls']}")
-
-    # Test 4: Text-only response
-    print("\n=== Test 4: Text only ===")
-    r4 = emulator.parse_response(
-        '{"content": "Hello! How can I help?"}',
-        test_tools,
-    )
-    print(f"Type: {r4['type']}, Content: {r4['content']}")
-
-    # Test 5: Build OpenAI response
-    print("\n=== Test 5: OpenAI response format ===")
-    response = emulator.build_openai_response(r1, "gpt-4", 50, 30)
-    print(json.dumps(response, indent=2))
+            comp_tokens = 
