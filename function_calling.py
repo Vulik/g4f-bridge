@@ -463,4 +463,32 @@ RULES:
                 "content": content,
             }
             finish_reason = "stop"
-            comp_tokens = 
+            comp_tokens = max(1, len(content) // 4)
+
+        return {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": comp_tokens,
+                "total_tokens": prompt_tokens + comp_tokens,
+            },
+        }
+
+
+# Global
+_emulator: Optional[FunctionCallingEmulator] = None
+
+
+def get_emulator() -> FunctionCallingEmulator:
+    global _emulator
+    if _emulator is None:
+        _emulator = FunctionCallingEmulator()
+    return _emulator
