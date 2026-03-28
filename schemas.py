@@ -2,7 +2,7 @@
 schemas.py
 ~~~~~~~~~~
 Pydantic models yang mereplikasi format OpenAI Chat Completions API
-agar PicoClaw bisa berkomunikasi tanpa adaptasi tambahan.
+agar PicoClaw bisa berkomunikasi tanpa adaptasi.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import List, Optional, Union
 from pydantic import BaseModel, Field
 
 
-# ───────────────────── REQUEST ─────────────────────
+# ────────────────────── REQUEST ───────────────────
 
 class ChatMessage(BaseModel):
     role: str
@@ -23,7 +23,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "gpt-4o-mini"
+    model: str = "auto"
     messages: List[ChatMessage]
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
@@ -34,7 +34,7 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
 
 
-# ───────────────────── RESPONSE (non-stream) ──────
+# ────────────────────── RESPONSE (non-stream) ────
 
 class Choice(BaseModel):
     index: int = 0
@@ -59,7 +59,7 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage = Field(default_factory=Usage)
 
 
-# ───────────────────── RESPONSE (stream / SSE) ────
+# ────────────────────── RESPONSE (stream / SSE) ──
 
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
