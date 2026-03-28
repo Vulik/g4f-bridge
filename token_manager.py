@@ -1,15 +1,44 @@
 """
-Token management: dual-mode counting, session rotation, auto-continuation.
+Token management — simplified & stateless.
+No sessions, no continuation. Just counting + smart truncation.
 """
 
 import re
-import uuid
-import threading
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass, field
-from datetime import datetime
-from collections import OrderedDict
+from dataclasses import dataclass
 from logger_setup import get_logger
+
+
+# ═══════════════════════════════════════════════════════════════
+# Model Token Limits (for premium enforcement)
+# ═══════════════════════════════════════════════════════════════
+
+MODEL_TOKEN_LIMITS: Dict[str, int] = {
+    # OpenAI
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-3.5-turbo": 16385,
+    "gpt-3.5-turbo-16k": 16385,
+    # Anthropic
+    "claude-3-opus": 200000,
+    "claude-3-sonnet": 200000,
+    "claude-3.5-sonnet": 200000,
+    "claude-3-haiku": 200000,
+    # Google
+    "gemini-1.5-pro": 1000000,
+    "gemini-1.5-flash": 1000000,
+    "gemini-pro": 30720,
+    # Meta
+    "llama-3.3-70b-versatile": 32768,
+    "llama-3.1-70b": 131072,
+    # Mistral
+    "mixtral-8x7b-32768": 32768,
+    "mistral-large": 32768,
+}
+
+DEFAULT_TOKEN_LIMIT = 8192
 
 
 @dataclass
@@ -22,9 +51,11 @@ class TokenCount:
         self.total_tokens = self.prompt_tokens + self.completion_tokens
 
 
-class TokenCounter:
-    """Dual-mode token counter."""
+# ═══════════════════════════════════════════════════════════════
+# Token Counter (dual-mode: tiktoken or fallback)
+# ═══════════════════════════════════════════════════════════════
 
+class TokenCounter:
     def __init__(self) -> None:
         from environment import get_environment
 
@@ -47,206 +78,144 @@ class TokenCounter:
             self.logger.info("Using fallback token estimator")
 
     def count_text(self, text: str) -> int:
-        """Count tokens in text."""
         if not text:
             return 0
-
         if self.use_tiktoken and self._encoding:
             try:
                 return len(self._encoding.encode(text))
             except Exception:
                 pass
-
         return self._fallback_count(text)
 
     @staticmethod
     def _fallback_count(text: str) -> int:
-        """Estimate token count without tiktoken (~85-90% accuracy)."""
         if not text:
             return 0
         ascii_chars = sum(1 for c in text if ord(c) < 128)
         ratio = ascii_chars / max(len(text), 1)
-
         if ratio > 0.8:
-            # English: ~1 token per 4 characters
             return max(1, len(text) // 4)
         else:
-            # CJK/mixed: ~1 token per 2-3 characters
             return max(1, len(text) // 2)
 
     def count_messages(self, messages: List[Dict[str, str]]) -> int:
-        """Count tokens in message list."""
         total = 0
         for msg in messages:
-            total += 4  # role + formatting overhead
-            total += self.count_text(msg.get("content", ""))
+            total += 4
+            total += self.count_text(msg.get("content", "") or "")
             if "name" in msg:
                 total += self.count_text(msg["name"]) + 1
-        total += 2  # conversation framing
+            # Count tool_calls if present
+            tc = msg.get("tool_calls")
+            if tc:
+                import json as _json
+                total += self.count_text(_json.dumps(tc))
+        total += 2
         return total
 
 
-class LRUSessionCache(OrderedDict):
-    """LRU cache for sessions to prevent memory leaks."""
-
-    def __init__(self, maxsize: int = 200) -> None:
-        super().__init__()
-        self.maxsize = maxsize
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        while len(self) > self.maxsize:
-            self.popitem(last=False)
-
-
-@dataclass
-class Session:
-    id: str
-    conversation_id: str
-    messages: List[Dict[str, str]] = field(default_factory=list)
-    token_count: int = 0
-    created_at: datetime = field(default_factory=datetime.now)
-    active: bool = True
-
-
-class ContinuationHandler:
-    """Detects truncated responses and creates continuation prompts."""
-
-    def __init__(self, max_continuations: int = 5) -> None:
-        self.max_continuations = max_continuations
-
-    @staticmethod
-    def needs_continuation(response: str, finish_reason: str) -> bool:
-        if finish_reason == "length":
-            return True
-        if not response:
-            return False
-
-        stripped = response.rstrip()
-
-        # Unclosed code blocks
-        if stripped.count("```") % 2 != 0:
-            return True
-
-        # Unclosed brackets (only if significant imbalance)
-        for o, c in [("{", "}"), ("[", "]"), ("(", ")")]:
-            if abs(stripped.count(o) - stripped.count(c)) > 2:
-                return True
-
-        return False
-
-    @staticmethod
-    def create_continuation_prompt(last_response: str) -> str:
-        ctx = last_response[-80:].strip()
-        return f"Continue exactly from where you left off. Last text was: \"{ctx}\""
-
-    @staticmethod
-    def merge_responses(responses: List[str]) -> str:
-        if not responses:
-            return ""
-        merged = responses[0]
-        for i in range(1, len(responses)):
-            part = responses[i]
-            # Try to remove echoed context
-            part = re.sub(
-                r'^(Continue|Continuing|Last text was).*?\n',
-                '', part, count=1, flags=re.IGNORECASE,
-            )
-            merged += part
-        return merged
-
+# ═══════════════════════════════════════════════════════════════
+# Token Manager (stateless)
+# ═══════════════════════════════════════════════════════════════
 
 class TokenManager:
-    """Main token manager."""
-
     def __init__(self) -> None:
         from config import get_config
-        from environment import get_environment
-
-        cfg = get_config().token_manager
-        env = get_environment()
 
         self.logger = get_logger("token_manager")
         self.counter = TokenCounter()
-        self.continuation = ContinuationHandler(cfg.max_continuations)
-
-        self.max_tokens = cfg.max_tokens_per_session
-        self.enable_continuation = cfg.enable_auto_continuation
-        self.sliding_window = cfg.sliding_window_messages
-
-        max_sessions = 100 if env.lightweight_mode else 500
-        self._sessions = LRUSessionCache(maxsize=max_sessions)
-        self._lock = threading.Lock()
+        self.cfg = get_config().token_management
 
     def prepare_messages(
         self,
         messages: List[Dict[str, str]],
-        conversation_id: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, str]], str]:
-        """Prepare messages with sliding window and session management."""
-        if conversation_id is None:
-            conversation_id = str(uuid.uuid4())
-
-        # Apply sliding window
-        if self.sliding_window > 0:
-            messages = self._apply_sliding_window(messages)
-
-        # Get or create session
-        session_id = self._get_or_create_session(conversation_id, messages)
-
-        return messages, session_id
-
-    def _apply_sliding_window(
-        self, messages: List[Dict[str, str]]
+        provider_type: str = "g4f",
+        model: str = "gpt-4",
     ) -> List[Dict[str, str]]:
-        if len(messages) <= self.sliding_window:
+        """
+        Prepare messages based on provider type.
+
+        Args:
+            messages: Raw messages from PicoClaw.
+            provider_type: "premium" or "g4f".
+            model: Model name for limit lookup.
+
+        Returns:
+            Possibly truncated messages.
+        """
+        if not messages:
+            return messages
+
+        if provider_type == "premium" and self.cfg.premium_enforce_limit:
+            limit = MODEL_TOKEN_LIMITS.get(model, DEFAULT_TOKEN_LIMIT)
+            # Reserve 20% for completion
+            max_prompt = int(limit * 0.8)
+            current = self.counter.count_messages(messages)
+
+            if current > max_prompt:
+                self.logger.info(
+                    f"Premium truncation: {current} > {max_prompt} tokens"
+                )
+                return self._smart_truncate(messages, max_prompt)
+            return messages
+
+        # g4f: pass through (no truncation by default)
+        return messages
+
+    def prepare_messages_with_window(
+        self,
+        messages: List[Dict[str, str]],
+        window: int = 0,
+    ) -> List[Dict[str, str]]:
+        """Apply sliding window (used as fallback on context-too-long error)."""
+        if window <= 0:
+            window = self.cfg.g4f_sliding_window
+
+        if len(messages) <= window:
             return messages
 
         system_msgs = [m for m in messages if m.get("role") == "system"]
         other_msgs = [m for m in messages if m.get("role") != "system"]
-        return system_msgs + other_msgs[-self.sliding_window:]
+        return system_msgs + other_msgs[-window:]
 
-    def _get_or_create_session(
-        self, conversation_id: str, messages: List[Dict[str, str]]
-    ) -> str:
-        with self._lock:
-            # Find active session
-            for sid, session in self._sessions.items():
-                if session.conversation_id == conversation_id and session.active:
-                    token_count = self.counter.count_messages(messages)
-                    if session.token_count + token_count > self.max_tokens:
-                        session.active = False
-                        self.logger.info(f"Session {sid} rotated (token limit)")
-                        break
-                    session.messages = messages
-                    session.token_count = token_count
-                    return sid
+    def _smart_truncate(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> List[Dict[str, str]]:
+        """Truncate messages to fit token limit, keeping system + recent."""
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        other_msgs = [m for m in messages if m.get("role") != "system"]
 
-            # Create new session
-            sid = str(uuid.uuid4())
-            self._sessions[sid] = Session(
-                id=sid,
-                conversation_id=conversation_id,
-                messages=messages,
-                token_count=self.counter.count_messages(messages),
-            )
-            return sid
+        # Always keep system messages
+        base_tokens = self.counter.count_messages(system_msgs) if system_msgs else 0
+        remaining = max_tokens - base_tokens
 
-    def count_tokens(self, messages: List[Dict[str, str]], model: str = "gpt-4") -> TokenCount:
+        # Add messages from most recent backwards
+        kept = []
+        for msg in reversed(other_msgs):
+            msg_tokens = self.counter.count_messages([msg])
+            if remaining - msg_tokens < 0:
+                break
+            kept.insert(0, msg)
+            remaining -= msg_tokens
+
+        return system_msgs + kept
+
+    def count_tokens(
+        self,
+        messages: List[Dict[str, str]],
+        model: str = "gpt-4",
+    ) -> TokenCount:
         return TokenCount(prompt_tokens=self.counter.count_messages(messages))
 
-    def handle_response(
-        self, response: str, finish_reason: str
-    ) -> Tuple[str, bool]:
-        needs_cont = False
-        if self.enable_continuation:
-            needs_cont = self.continuation.needs_continuation(response, finish_reason)
-        return response, needs_cont
 
+# ═══════════════════════════════════════════════════════════════
+# Global singleton
+# ═══════════════════════════════════════════════════════════════
 
-# Global
+import threading
+
 _tm_lock = threading.Lock()
 _token_manager: Optional[TokenManager] = None
 

@@ -1,6 +1,6 @@
 """
 Configuration management module.
-Updated with Function Calling and Provider Locking support.
+v3: Added Premium API, Testing, and Routing config.
 """
 
 import json
@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict, field
 
+
+# ═══════════════════════════════════════════════════════════════
+# Dataclass Sections
+# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class ServerConfig:
@@ -25,6 +29,24 @@ class ServerConfig:
 
 
 @dataclass
+class PremiumProviderEntry:
+    """Single premium API provider."""
+    name: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    models: List[str] = field(default_factory=list)
+    timeout: int = 60
+    enabled: bool = False
+
+
+@dataclass
+class PremiumAPIConfig:
+    """Premium API tier configuration."""
+    enabled: bool = False
+    providers: List[PremiumProviderEntry] = field(default_factory=list)
+
+
+@dataclass
 class G4FConfig:
     default_model: str = "auto"
     preferred_models: List[str] = field(default_factory=lambda: [
@@ -37,53 +59,44 @@ class G4FConfig:
 
 @dataclass
 class FunctionCallingConfig:
-    """Function Calling Emulator configuration."""
     enabled: bool = True
-    max_parse_retries: int = 2        # Retry with stronger prompt if JSON parse fails
-    fallback_to_text: bool = True     # If all parsing fails, return text response
-    log_injected_prompt: bool = False  # Debug: log the injected system prompt
+    max_parse_retries: int = 2
+    fallback_to_text: bool = True
+    log_injected_prompt: bool = False
 
 
 @dataclass
-class ProviderLockConfig:
-    """Provider Locking configuration."""
-    strict_provider_mode: bool = False  # Lock to single provider
-    locked_provider: str = ""           # Provider name (e.g., "Blackbox")
-    locked_model: str = ""              # Model name (e.g., "deepseek-r1")
-    fail_on_lock_error: bool = True     # Error instead of fallback
+class TestingConfig:
+    """Background provider testing configuration."""
+    enabled: bool = True
+    background_worker: bool = True
+    scan_interval_minutes: int = 5
+    test_timeout_seconds: int = 30
+    sequential_delay_seconds: int = 3
+    max_dead_streak: int = 3
+    retest_intervals_minutes: Dict[str, int] = field(default_factory=lambda: {
+        "active": 360,
+        "fc_capable": 360,
+        "chat_only": 720,
+        "unstable": 30,
+        "dead": 1440,
+        "untested": 0,
+    })
 
 
 @dataclass
-class MCPConfig:
-    """MCP (Model Context Protocol) offloading configuration."""
-    enabled: bool = False
-    g4f_mcp_url: str = "http://localhost:8765"  # g4f MCP server URL
-    # NOTE: MCP offloading means PicoClaw connects to g4f MCP server
-    # DIRECTLY for tool execution, while using this bridge only for
-    # LLM reasoning. See README for setup instructions.
+class RoutingConfig:
+    """Routing behaviour configuration."""
+    g4f_max_fallbacks: int = 5
+    prefer_fc_score_above: int = 60
 
 
 @dataclass
-class TokenManagerConfig:
-    max_tokens_per_session: int = 45000
-    enable_auto_continuation: bool = True
-    max_continuations: int = 5
-    enable_context_summarization: bool = True
-    sliding_window_messages: int = 20
-
-
-@dataclass
-class ScannerConfig:
-    scan_interval_minutes: int = 30
-    lazy_health_check: bool = True
-    initial_scan_on_startup: bool = True
-
-
-@dataclass
-class UpdaterConfig:
-    auto_update_enabled: bool = False
-    check_interval_hours: int = 6
-    auto_rescan_after_update: bool = True
+class TokenManagementConfig:
+    """Simplified token management."""
+    smart_truncation: bool = True
+    premium_enforce_limit: bool = True
+    g4f_sliding_window: int = 30
 
 
 @dataclass
@@ -98,55 +111,74 @@ class CircuitBreakerConfig:
 class StorageConfig:
     database_file: str = "bridge_data.db"
     max_database_size_mb: int = 50
-    conversation_retention_hours: int = 168
 
+
+# ═══════════════════════════════════════════════════════════════
+# Root Config
+# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
+    premium_api: PremiumAPIConfig = field(default_factory=PremiumAPIConfig)
     g4f: G4FConfig = field(default_factory=G4FConfig)
     function_calling: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
-    provider_lock: ProviderLockConfig = field(default_factory=ProviderLockConfig)
-    mcp: MCPConfig = field(default_factory=MCPConfig)
-    token_manager: TokenManagerConfig = field(default_factory=TokenManagerConfig)
-    scanner: ScannerConfig = field(default_factory=ScannerConfig)
-    updater: UpdaterConfig = field(default_factory=UpdaterConfig)
+    testing: TestingConfig = field(default_factory=TestingConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
+    token_management: TokenManagementConfig = field(default_factory=TokenManagementConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "server": asdict(self.server),
-            "g4f": asdict(self.g4f),
-            "function_calling": asdict(self.function_calling),
-            "provider_lock": asdict(self.provider_lock),
-            "mcp": asdict(self.mcp),
-            "token_manager": asdict(self.token_manager),
-            "scanner": asdict(self.scanner),
-            "updater": asdict(self.updater),
-            "circuit_breaker": asdict(self.circuit_breaker),
-            "storage": asdict(self.storage),
-        }
+        d = {}
+        for section_name in (
+            "server", "premium_api", "g4f", "function_calling",
+            "testing", "routing", "token_management",
+            "circuit_breaker", "storage",
+        ):
+            val = getattr(self, section_name)
+            if section_name == "premium_api":
+                d[section_name] = {
+                    "enabled": val.enabled,
+                    "providers": [asdict(p) for p in val.providers],
+                }
+            elif section_name == "testing":
+                d[section_name] = asdict(val)
+            else:
+                d[section_name] = asdict(val)
+        return d
+
+    def to_safe_dict(self) -> Dict[str, Any]:
+        """to_dict but with API keys masked."""
+        d = self.to_dict()
+        # Mask server key
+        k = d.get("server", {}).get("api_key", "")
+        if len(k) > 8:
+            d["server"]["api_key"] = k[:4] + "..." + k[-4:]
+        # Mask premium keys
+        for p in d.get("premium_api", {}).get("providers", []):
+            k = p.get("api_key", "")
+            if len(k) > 8:
+                p["api_key"] = k[:4] + "..." + k[-4:]
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
-        """Create from dictionary with safe merging."""
         cfg = cls()
 
-        section_map = [
+        # Simple sections (auto-merge)
+        simple_sections = [
             ("server", ServerConfig),
             ("g4f", G4FConfig),
             ("function_calling", FunctionCallingConfig),
-            ("provider_lock", ProviderLockConfig),
-            ("mcp", MCPConfig),
-            ("token_manager", TokenManagerConfig),
-            ("scanner", ScannerConfig),
-            ("updater", UpdaterConfig),
+            ("testing", TestingConfig),
+            ("routing", RoutingConfig),
+            ("token_management", TokenManagementConfig),
             ("circuit_breaker", CircuitBreakerConfig),
             ("storage", StorageConfig),
         ]
 
-        for section_name, section_cls in section_map:
+        for section_name, section_cls in simple_sections:
             section_data = data.get(section_name, {})
             if isinstance(section_data, dict):
                 valid_fields = {
@@ -160,8 +192,33 @@ class Config:
                 except TypeError:
                     pass
 
+        # Premium API (needs special handling for nested list)
+        premium_data = data.get("premium_api", {})
+        if isinstance(premium_data, dict):
+            cfg.premium_api = PremiumAPIConfig(
+                enabled=premium_data.get("enabled", False),
+                providers=[],
+            )
+            for p in premium_data.get("providers", []):
+                if isinstance(p, dict):
+                    valid = {
+                        f.name
+                        for f in PremiumProviderEntry.__dataclass_fields__.values()
+                    }
+                    filtered = {k: v for k, v in p.items() if k in valid}
+                    try:
+                        cfg.premium_api.providers.append(
+                            PremiumProviderEntry(**filtered)
+                        )
+                    except TypeError:
+                        pass
+
         return cfg
 
+
+# ═══════════════════════════════════════════════════════════════
+# ConfigManager (unchanged logic, updated Config)
+# ═══════════════════════════════════════════════════════════════
 
 class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None) -> None:
@@ -190,7 +247,6 @@ class ConfigManager:
                 print(f"ℹ Creating default config at {self.config_path}")
                 self.config = Config()
                 self._save_internal()
-
         return self.config
 
     def save(self) -> None:
@@ -238,4 +294,4 @@ def reload_config() -> Config:
 
 if __name__ == "__main__":
     config = get_config()
-    print(json.dumps(config.to_dict(), indent=2))
+    print(json.dumps(config.to_safe_dict(), indent=2))
