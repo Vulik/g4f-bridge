@@ -1,6 +1,6 @@
 """
 Configuration management module.
-v4: Simplified testing - startup only + 24h interval.
+v5: With Premium API support.
 """
 
 import json
@@ -17,6 +17,24 @@ class ServerConfig:
     api_key: str = "sk-free"
     workers: int = 1
     log_level: str = "INFO"
+
+
+@dataclass
+class PremiumProviderConfig:
+    """Single premium API provider."""
+    name: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    models: List[str] = field(default_factory=list)
+    timeout: int = 60
+    enabled: bool = False
+
+
+@dataclass
+class PremiumAPIConfig:
+    """Premium API configuration."""
+    enabled: bool = False
+    providers: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -39,10 +57,8 @@ class FunctionCallingConfig:
 
 @dataclass
 class TestingConfig:
-    """Testing config — startup + 24h interval."""
     enabled: bool = True
     test_on_startup: bool = True
-    startup_timeout_minutes: int = 10
     retest_interval_hours: int = 24
     test_timeout_seconds: int = 30
     sequential_delay_seconds: int = 2
@@ -85,6 +101,7 @@ class UpdaterConfig:
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
+    premium_api: PremiumAPIConfig = field(default_factory=PremiumAPIConfig)
     g4f: G4FConfig = field(default_factory=G4FConfig)
     function_calling: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
     testing: TestingConfig = field(default_factory=TestingConfig)
@@ -102,13 +119,30 @@ class Config:
             "circuit_breaker", "storage", "updater",
         ):
             d[section_name] = asdict(getattr(self, section_name))
+        
+        # Premium API - special handling
+        d["premium_api"] = {
+            "enabled": self.premium_api.enabled,
+            "providers": self.premium_api.providers,
+        }
+        
         return d
 
     def to_safe_dict(self) -> Dict[str, Any]:
+        """to_dict but with API keys masked."""
         d = self.to_dict()
+        
+        # Mask server key
         k = d.get("server", {}).get("api_key", "")
         if len(k) > 8:
             d["server"]["api_key"] = k[:4] + "..." + k[-4:]
+        
+        # Mask premium API keys
+        for p in d.get("premium_api", {}).get("providers", []):
+            k = p.get("api_key", "")
+            if len(k) > 8:
+                p["api_key"] = k[:4] + "..." + k[-4:]
+        
         return d
 
     @classmethod
@@ -140,6 +174,14 @@ class Config:
                     setattr(cfg, section_name, section_cls(**filtered))
                 except TypeError:
                     pass
+
+        # Premium API - special handling
+        premium_data = data.get("premium_api", {})
+        if isinstance(premium_data, dict):
+            cfg.premium_api = PremiumAPIConfig(
+                enabled=premium_data.get("enabled", False),
+                providers=premium_data.get("providers", []),
+            )
 
         return cfg
 
