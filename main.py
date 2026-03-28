@@ -1,5 +1,5 @@
 """
-Main server v3 — Two-tier routing + Background Testing + Request ID.
+Main server v3 — g4f only, Background Testing, Request ID, PicoClaw compatible.
 """
 
 import os
@@ -36,14 +36,13 @@ from token_manager import get_token_manager
 from resilience import get_resilience
 from updater import get_updater, get_update_scheduler
 from function_calling import get_emulator
-from premium_adapter import get_premium_adapter
 from test_worker import get_test_worker
 
 BRIDGE_VERSION = "3.0.0"
 
 
 # ═══════════════════════════════════════════════════════════════
-# Request ID
+# Helpers
 # ═══════════════════════════════════════════════════════════════
 
 def _gen_request_id() -> str:
@@ -52,6 +51,13 @@ def _gen_request_id() -> str:
 
 def _gen_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _strip_model_prefix(model: str) -> str:
+    """Strip protocol prefix: openai/gpt-4o → gpt-4o"""
+    if "/" in model and model != "auto":
+        return model.split("/", 1)[-1]
+    return model
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -110,6 +116,11 @@ def build_error(
 
 def build_models_list(models: List[str]) -> Dict[str, Any]:
     ts = int(time.time())
+    # Include both raw and prefixed versions for PicoClaw
+    all_models = set(models)
+    for m in models:
+        all_models.add(f"openai/{m}")
+
     return {
         "object": "list",
         "data": [
@@ -117,9 +128,37 @@ def build_models_list(models: List[str]) -> Dict[str, Any]:
                 "id": m, "object": "model",
                 "created": ts, "owned_by": "g4f-bridge",
             }
-            for m in models
+            for m in sorted(all_models)
         ],
     }
+
+
+def ensure_openai_format(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure response has all fields PicoClaw expects."""
+    if "error" in response:
+        return response
+
+    response.setdefault("id", _gen_id())
+    response.setdefault("object", "chat.completion")
+    response.setdefault("created", int(time.time()))
+    response.setdefault("model", "unknown")
+
+    choices = response.get("choices", [])
+    for choice in choices:
+        msg = choice.get("message", {})
+        # content must be string (not None) unless tool_calls present
+        if not msg.get("tool_calls") and msg.get("content") is None:
+            msg["content"] = ""
+        choice.setdefault("finish_reason", "stop")
+        choice.setdefault("index", 0)
+
+    response.setdefault("usage", {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    })
+
+    return response
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -127,6 +166,8 @@ def build_models_list(models: List[str]) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════
 
 def _verify_key(auth_header: Optional[str]) -> bool:
+    if not config.server.api_key:
+        return True  # No key configured = accept all
     if not auth_header:
         return False
     parts = auth_header.split()
@@ -143,13 +184,11 @@ async def handle_chat_request(
     body: Dict[str, Any],
     request_id: str = "",
 ) -> Dict[str, Any]:
-    """
-    Main handler with two-tier routing.
+    """Main handler — g4f with FC emulation."""
 
-    Tier 1: Premium API (native FC, passthrough).
-    Tier 2: g4f (with FC emulation if needed).
-    """
-    model = body.get("model", config.g4f.default_model)
+    model = _strip_model_prefix(
+        body.get("model", config.g4f.default_model)
+    )
     messages = body.get("messages", [])
     tools = body.get("tools", [])
     tool_choice = body.get("tool_choice", "auto")
@@ -173,65 +212,21 @@ async def handle_chat_request(
     has_tools = fc_config.enabled and emulator.has_tools(body)
     has_results = emulator.has_tool_results(messages)
 
-    # ══════════════════════════════════════════════════════
-    # TIER 1: Premium API (passthrough — native FC)
-    # ══════════════════════════════════════════════════════
-
-    if config.premium_api.enabled:
-        result = await router._route_premium(
-            model=model,
-            messages=messages,
-            stream=stream,
-            request_id=request_id,
-            tools=tools if has_tools or has_results else None,
-            tool_choice=tool_choice,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-        if result.success:
-            if result.is_premium_response:
-                # Streaming — return generator marker
-                if stream and hasattr(result.response, '__aiter__'):
-                    return {
-                        "__stream_premium__": True,
-                        "generator": result.response,
-                        "request_id": request_id,
-                    }
-
-                # Non-streaming — response is already OpenAI dict
-                usage = result.response.get("usage", {})
-                logger.info(
-                    f"[{request_id}] ← tier=premium "
-                    f"provider={result.provider_name} "
-                    f"tokens={usage.get('prompt_tokens', '?')}"
-                    f"+{usage.get('completion_tokens', '?')} "
-                    f"time={result.response_time:.1f}s"
-                )
-                return result.response
-
-        logger.warning(
-            f"[{request_id}] Premium tier failed: {result.error} "
-            f"| fallback to g4f"
-        )
-
-    # ══════════════════════════════════════════════════════
-    # TIER 2: g4f (with FC emulation)
-    # ══════════════════════════════════════════════════════
-
     # ── Determine FC mode ─────────────────────────────────
     if has_results:
-        logger.info(f"[{request_id}] 📥 Processing tool results (g4f)")
+        logger.info(f"[{request_id}] 📥 Processing tool results")
         prepared, mode = emulator.build_messages(messages, [], "auto")
         mode = "result"
         stream = False
 
     elif has_tools:
-        logger.info(f"[{request_id}] 🔧 FC mode: {len(tools)} tools (g4f)")
+        logger.info(
+            f"[{request_id}] 🔧 FC mode: {len(tools)} tools"
+        )
         prepared, mode = emulator.build_messages(
             messages, tools, tool_choice
         )
-        stream = False
+        stream = False  # Force non-streaming for JSON parsing
 
     else:
         prepared = messages
@@ -253,17 +248,17 @@ async def handle_chat_request(
     if mode == "fc":
         temperature = min(temperature, 0.3)
 
-    g4f_result = await router._route_g4f(
+    result = await router.route(
         model=model, messages=prepared, stream=False,
         request_id=request_id,
         temperature=temperature, max_tokens=max_tokens,
         _has_tools=has_tools,
     )
 
-    if not g4f_result.success:
-        return build_error(g4f_result.error or "All providers failed")
+    if not result.success:
+        return build_error(result.error or "All providers failed")
 
-    raw = str(g4f_result.response)
+    raw = str(result.response)
 
     # ── Parse FC response ─────────────────────────────────
     if mode in ("fc", "result"):
@@ -288,15 +283,15 @@ async def handle_chat_request(
                 ),
             })
 
-            retry = await router._route_g4f(
+            retry_result = await router.route(
                 model=model, messages=retry_msgs, stream=False,
                 request_id=request_id,
                 temperature=0.1, max_tokens=max_tokens,
             )
 
-            if retry.success:
+            if retry_result.success:
                 parsed = emulator.parse_response(
-                    str(retry.response), tools, mode
+                    str(retry_result.response), tools, mode
                 )
 
         token_count = tm.count_tokens(prepared, model)
@@ -311,15 +306,15 @@ async def handle_chat_request(
             ]
             logger.info(
                 f"[{request_id}] ← tier=g4f "
-                f"provider={g4f_result.provider_name} "
+                f"provider={result.provider_name} "
                 f"fc={','.join(names)} "
-                f"time={g4f_result.response_time:.1f}s"
+                f"time={result.response_time:.1f}s"
             )
         else:
             logger.info(
                 f"[{request_id}] ← tier=g4f "
-                f"provider={g4f_result.provider_name} "
-                f"time={g4f_result.response_time:.1f}s"
+                f"provider={result.provider_name} "
+                f"time={result.response_time:.1f}s"
             )
 
         return response
@@ -330,10 +325,10 @@ async def handle_chat_request(
 
     logger.info(
         f"[{request_id}] ← tier=g4f "
-        f"provider={g4f_result.provider_name} "
-        f"model={g4f_result.model_used} "
+        f"provider={result.provider_name} "
+        f"model={result.model_used} "
         f"tokens={token_count.prompt_tokens}+{comp_tokens} "
-        f"time={g4f_result.response_time:.1f}s"
+        f"time={result.response_time:.1f}s"
     )
 
     return build_completion(
@@ -380,16 +375,9 @@ if USE_FASTAPI:
     @app.on_event("startup")
     async def _startup() -> None:
         logger.info("Starting g4f-Bridge v3...")
-
-        # 1. Scan providers (fast)
         get_scanner().scan()
-
-        # 2. Start test worker (background, non-blocking)
         await get_test_worker().start_async()
-
-        # 3. Start update scheduler
         await get_update_scheduler().start()
-
         logger.info(f"Bridge ready on :{config.server.port}")
 
     @app.on_event("shutdown")
@@ -431,20 +419,7 @@ if USE_FASTAPI:
 
         result = await handle_chat_request(body, request_id)
 
-        # ── Premium streaming ──
-        if isinstance(result, dict) and result.get("__stream_premium__"):
-            return StreamingResponse(
-                result["generator"],
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "X-Request-ID": request_id,
-                },
-            )
-
-        # ── g4f streaming ──
+        # ── Streaming ──
         if isinstance(result, dict) and result.get("__stream__"):
             router_obj = result["router"]
             model = result["model"]
@@ -453,7 +428,7 @@ if USE_FASTAPI:
             return StreamingResponse(
                 _stream_gen(
                     router_obj, model, msgs,
-                    request_id=request_id,
+                    request_id=result.get("request_id", ""),
                     temperature=result.get("temperature", 0.7),
                     max_tokens=result.get("max_tokens", 4096),
                 ),
@@ -480,7 +455,7 @@ if USE_FASTAPI:
 
         # ── Success ──
         return JSONResponse(
-            content=result,
+            content=ensure_openai_format(result),
             headers={"X-Request-ID": request_id},
         )
 
@@ -491,7 +466,7 @@ if USE_FASTAPI:
     ) -> AsyncGenerator[str, None]:
         chunk_id = _gen_id()
         try:
-            result = await router._route_g4f(
+            result = await router.route(
                 model=model, messages=messages,
                 stream=True, request_id=request_id,
                 **kwargs,
@@ -539,7 +514,7 @@ if USE_FASTAPI:
             content=build_models_list(get_scanner().get_all_models())
         )
 
-    @app.get("/v1/models/{model_id}")
+    @app.get("/v1/models/{model_id:path}")
     async def get_model(
         model_id: str,
         authorization: Optional[str] = Header(None),
@@ -551,7 +526,12 @@ if USE_FASTAPI:
                     "Invalid API key", "authentication_error"
                 ),
             )
-        if model_id in get_scanner().get_all_models():
+
+        # Strip prefix for lookup
+        clean_id = _strip_model_prefix(model_id)
+        all_models = get_scanner().get_all_models()
+
+        if clean_id in all_models or model_id in all_models:
             return JSONResponse(content={
                 "id": model_id, "object": "model",
                 "created": int(time.time()),
@@ -575,7 +555,6 @@ if USE_FASTAPI:
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "version": BRIDGE_VERSION,
-            "premium_enabled": config.premium_api.enabled,
             "providers": summary,
         }
 
@@ -593,17 +572,6 @@ if USE_FASTAPI:
         worker = get_test_worker()
         return {
             "bridge_version": BRIDGE_VERSION,
-            "premium_api": {
-                "enabled": config.premium_api.enabled,
-                "providers": [
-                    {
-                        "name": p.name,
-                        "enabled": p.enabled,
-                        "models": p.models,
-                    }
-                    for p in config.premium_api.providers
-                ],
-            },
             "testing": worker._compute_summary(),
             "scanner": get_scanner().get_status(),
         }
@@ -641,6 +609,19 @@ if USE_FASTAPI:
             }
         }
 
+    @app.get("/compatibility")
+    async def compatibility(
+        authorization: Optional[str] = Header(None),
+    ) -> Any:
+        if not _verify_key(authorization):
+            return JSONResponse(
+                status_code=401,
+                content=build_error(
+                    "Unauthorized", "authentication_error"
+                ),
+            )
+        return {"models": get_scanner().model_to_providers}
+
     @app.post("/scan")
     async def trigger_scan(
         authorization: Optional[str] = Header(None),
@@ -653,14 +634,9 @@ if USE_FASTAPI:
                     "Unauthorized", "authentication_error"
                 ),
             )
-
-        # Rescan g4f providers
         get_scanner().scan()
-
-        # Trigger test worker
         worker = get_test_worker()
         worker.trigger_scan(force=force)
-
         return {
             "status": "scan triggered",
             "force": force,
@@ -751,9 +727,7 @@ else:
         finally:
             loop.close()
 
-        if isinstance(result, dict) and (
-            result.get("__stream__") or result.get("__stream_premium__")
-        ):
+        if isinstance(result, dict) and result.get("__stream__"):
             return jsonify(
                 build_error(
                     "Streaming requires FastAPI",
@@ -769,7 +743,7 @@ else:
             )
             return jsonify(result), status
 
-        resp = jsonify(result)
+        resp = jsonify(ensure_openai_format(result))
         resp.headers["X-Request-ID"] = request_id
         return resp
 
@@ -817,11 +791,8 @@ def handle_signal(signum: int, frame: Any) -> None:
 
 
 def print_banner() -> None:
-    premium_status = "✅ ON" if config.premium_api.enabled else "❌ OFF"
-    premium_names = [
-        p.name for p in config.premium_api.providers if p.enabled
-    ]
     testing_status = "✅ ON" if config.testing.enabled else "❌ OFF"
+    fc_status = "✅ ON" if config.function_calling.enabled else "❌ OFF"
 
     print()
     print("=" * 60)
@@ -830,13 +801,8 @@ def print_banner() -> None:
     print(f"  Server:       http://{config.server.host}:{config.server.port}")
     print(f"  API Key:      {config.server.api_key}")
     print(f"  Backend:      {'FastAPI' if USE_FASTAPI else 'Flask'}")
-    print(f"  Premium API:  {premium_status}", end="")
-    if premium_names:
-        print(f" ({', '.join(premium_names)})")
-    else:
-        print()
     print(f"  Testing:      {testing_status}")
-    print(f"  FC Emulation: {'✅ ON' if config.function_calling.enabled else '❌ OFF'}")
+    print(f"  FC Emulation: {fc_status}")
     print("-" * 60)
     print("  PicoClaw config:")
     print(f"    api_base = http://localhost:{config.server.port}/v1")

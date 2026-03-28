@@ -1,6 +1,7 @@
 """
 Function Calling Emulator v2 — Simplified & Robust.
 Handles full tool calling cycle including tool results.
+PicoClaw compatible.
 """
 
 import re
@@ -16,7 +17,6 @@ class JSONExtractor:
 
     @staticmethod
     def extract(text: str) -> Optional[Dict[str, Any]]:
-        """Extract first valid JSON object from text."""
         if not text or not text.strip():
             return None
 
@@ -75,7 +75,6 @@ class JSONExtractor:
                         try:
                             return json.loads(text[start:i + 1])
                         except (json.JSONDecodeError, ValueError):
-                            # Try next { in text
                             next_start = text.find('{', start + 1)
                             if next_start != -1:
                                 start = next_start
@@ -95,10 +94,9 @@ class FunctionCallingEmulator:
     2. Detect if request contains tool results
     3. Inject appropriate prompt
     4. Parse response
-    5. Format output
+    5. Format output (PicoClaw compatible)
     """
 
-    # SHORT prompt — AI lebih patuh dengan instruksi pendek
     FC_PROMPT = """You are a function-calling AI. Respond ONLY with valid JSON.
 
 Functions:
@@ -122,7 +120,6 @@ RULES:
     # ── Detection ─────────────────────────────────────────
 
     def has_tools(self, body: Dict[str, Any]) -> bool:
-        """Check if request contains tools."""
         tools = body.get("tools")
         if not tools:
             return False
@@ -131,18 +128,12 @@ RULES:
         return True
 
     def has_tool_results(self, messages: List[Dict[str, str]]) -> bool:
-        """
-        Check if messages contain tool results (Step 3).
-        This means PicoClaw already executed a tool and is
-        sending the result back for AI to process.
-        """
         for msg in messages:
             if msg.get("role") == "tool":
                 return True
         return False
 
     def has_pending_tool_calls(self, messages: List[Dict[str, str]]) -> bool:
-        """Check if last assistant message has tool_calls."""
         for msg in reversed(messages):
             if msg.get("role") == "assistant":
                 if msg.get("tool_calls"):
@@ -158,36 +149,19 @@ RULES:
         tools: List[Dict[str, Any]],
         tool_choice: Any = "auto",
     ) -> Tuple[List[Dict[str, str]], str]:
-        """
-        Build messages based on conversation state.
-
-        Returns:
-            (modified_messages, mode)
-            mode: "fc" = expecting tool_calls
-                  "result" = processing tool results
-                  "chat" = normal chat
-        """
-        # ── Case 1: Tool results present ──────────────────
-        # PicoClaw executed tool, sending result back
-        # DO NOT inject FC prompt — AI should read result and respond
+        # Case 1: Tool results present
         if self.has_tool_results(messages):
             self.logger.info("📥 Tool result detected — forwarding to AI")
-
-            # Clean messages for g4f compatibility
             cleaned = self._clean_tool_messages(messages)
             return cleaned, "result"
 
-        # ── Case 2: Tools requested, need FC ──────────────
+        # Case 2: Tools requested, need FC
         if tools:
             self.logger.info(f"🔧 FC Mode: {len(tools)} tools")
 
-            # Build compact tool list
             tool_str = self._format_tools_compact(tools)
-
-            # Build FC prompt
             fc_prompt = self.FC_PROMPT.format(tools=tool_str)
 
-            # Force specific tool if requested
             if tool_choice == "required":
                 fc_prompt += "\nYou MUST call a function. Text-only response is FORBIDDEN."
             elif isinstance(tool_choice, dict):
@@ -195,12 +169,10 @@ RULES:
                 if fname:
                     fc_prompt += f"\nYou MUST call: {fname}"
 
-            # Build message list
             enhanced = [{"role": "system", "content": fc_prompt}]
 
             for msg in messages:
                 if msg.get("role") == "system":
-                    # Merge original system prompt (keep short)
                     original = msg.get("content", "")
                     if original and len(original) < 500:
                         enhanced[0]["content"] += f"\n\nContext: {original}"
@@ -209,23 +181,18 @@ RULES:
 
             return enhanced, "fc"
 
-        # ── Case 3: Normal chat ───────────────────────────
+        # Case 3: Normal chat
         return messages, "chat"
 
     def _clean_tool_messages(
         self, messages: List[Dict[str, str]]
     ) -> List[Dict[str, str]]:
-        """
-        Clean tool-related messages for g4f compatibility.
-        g4f providers don't understand role:"tool", so convert it.
-        """
         cleaned = []
 
         for msg in messages:
             role = msg.get("role", "")
 
             if role == "tool":
-                # Convert tool result to user message
                 tool_call_id = msg.get("tool_call_id", "")
                 content = msg.get("content", "")
                 cleaned.append({
@@ -237,7 +204,6 @@ RULES:
                 })
 
             elif role == "assistant" and msg.get("tool_calls"):
-                # Convert assistant tool_calls to text
                 calls = msg.get("tool_calls", [])
                 call_desc = []
                 for tc in calls:
@@ -259,7 +225,6 @@ RULES:
     def _format_tools_compact(
         self, tools: List[Dict[str, Any]]
     ) -> str:
-        """Format tools as compact list."""
         lines = []
         for tool in tools:
             func = tool.get("function", {})
@@ -272,7 +237,6 @@ RULES:
                 params_str = ", ".join(required)
                 lines.append(f"• {name}({params_str}) — {desc}")
             else:
-                # Show all properties briefly
                 props = list(params.get("properties", {}).keys())[:3]
                 params_str = ", ".join(props) if props else ""
                 lines.append(f"• {name}({params_str}) — {desc}")
@@ -287,27 +251,10 @@ RULES:
         tools: List[Dict[str, Any]],
         mode: str,
     ) -> Dict[str, Any]:
-        """
-        Parse AI response based on mode.
-
-        Args:
-            raw: Raw text from provider
-            tools: Available tools
-            mode: "fc", "result", or "chat"
-
-        Returns:
-            {
-                "type": "tool_calls" | "text",
-                "tool_calls": [...] | None,
-                "content": "..." | None
-            }
-        """
         if not raw or not raw.strip():
             return {"type": "text", "tool_calls": None, "content": ""}
 
-        # For "result" and "chat" mode — just return text
         if mode in ("result", "chat"):
-            # Still try to extract content from JSON if present
             parsed = JSONExtractor.extract(raw)
             if parsed and "content" in parsed:
                 return {
@@ -317,11 +264,10 @@ RULES:
                 }
             return {"type": "text", "tool_calls": None, "content": raw}
 
-        # For "fc" mode — try to extract tool_calls
+        # FC mode
         parsed = JSONExtractor.extract(raw)
 
         if parsed:
-            # Check for content-only response
             if "content" in parsed and "tool_calls" not in parsed:
                 return {
                     "type": "text",
@@ -329,7 +275,6 @@ RULES:
                     "content": str(parsed["content"]),
                 }
 
-            # Extract tool_calls
             tool_calls = self._normalize_tool_calls(parsed, tools)
             if tool_calls:
                 names = [tc["function"]["name"] for tc in tool_calls]
@@ -340,7 +285,6 @@ RULES:
                     "content": None,
                 }
 
-        # Failed to parse
         self.logger.warning("❌ No tool_calls found in response")
         return {"type": "text", "tool_calls": None, "content": raw}
 
@@ -349,14 +293,12 @@ RULES:
         parsed: Dict[str, Any],
         tools: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Normalize various formats to OpenAI tool_calls."""
         tool_names = set()
         for t in tools:
             func = t.get("function", {})
             if "name" in func:
                 tool_names.add(func["name"])
 
-        # Find raw calls
         raw_calls = []
 
         if "tool_calls" in parsed:
@@ -372,7 +314,6 @@ RULES:
         if not raw_calls:
             return []
 
-        # Normalize each call
         result = []
         for raw in raw_calls:
             name = None
@@ -383,17 +324,18 @@ RULES:
                 arguments = raw["function"].get("arguments", {})
             else:
                 name = raw.get("name", raw.get("function_name"))
-                arguments = raw.get("arguments", raw.get("parameters", raw.get("params", {})))
+                arguments = raw.get(
+                    "arguments",
+                    raw.get("parameters", raw.get("params", {}))
+                )
 
             if not name:
                 continue
 
-            # Match tool name
             matched = self._match_name(name, tool_names)
             if not matched:
                 continue
 
-            # Ensure arguments is string
             if isinstance(arguments, dict):
                 args_str = json.dumps(arguments, ensure_ascii=False)
             elif isinstance(arguments, str):
@@ -415,7 +357,6 @@ RULES:
 
     @staticmethod
     def _match_name(candidate: str, available: set) -> Optional[str]:
-        """Fuzzy match tool name."""
         if candidate in available:
             return candidate
 
@@ -424,12 +365,10 @@ RULES:
             if name.lower() == cl:
                 return name
 
-        # Partial match
         for name in available:
             if cl in name.lower() or name.lower() in cl:
                 return name
 
-        # Underscore/hyphen normalization
         cn = cl.replace(" ", "_").replace("-", "_")
         for name in available:
             if name.lower().replace(" ", "_").replace("-", "_") == cn:
@@ -437,7 +376,7 @@ RULES:
 
         return None
 
-    # ── Response Building ─────────────────────────────────
+    # ── Response Building (PicoClaw Compatible) ───────────
 
     def build_response(
         self,
@@ -445,13 +384,13 @@ RULES:
         model: str,
         prompt_tokens: int = 0,
     ) -> Dict[str, Any]:
-        """Build OpenAI-format response."""
+        """Build OpenAI-format response (PicoClaw compatible)."""
         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if parsed["type"] == "tool_calls" and parsed["tool_calls"]:
             message = {
                 "role": "assistant",
-                "content": None,
+                "content": "",  # PicoClaw expects string, not null
                 "tool_calls": parsed["tool_calls"],
             }
             finish_reason = "tool_calls"

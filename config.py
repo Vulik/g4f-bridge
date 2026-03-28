@@ -1,6 +1,6 @@
 """
 Configuration management module.
-v3: Added Premium API, Testing, and Routing config.
+v3: With Testing, Routing, Updater config. Simple API key.
 """
 
 import json
@@ -11,39 +11,13 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict, field
 
 
-# ═══════════════════════════════════════════════════════════════
-# Dataclass Sections
-# ═══════════════════════════════════════════════════════════════
-
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8080
-    api_key: str = ""
+    api_key: str = "sk-free"
     workers: int = 1
     log_level: str = "INFO"
-
-    def __post_init__(self) -> None:
-        if not self.api_key:
-            self.api_key = "sk-" + secrets.token_urlsafe(32)
-
-
-@dataclass
-class PremiumProviderEntry:
-    """Single premium API provider."""
-    name: str = ""
-    api_key: str = ""
-    base_url: str = ""
-    models: List[str] = field(default_factory=list)
-    timeout: int = 60
-    enabled: bool = False
-
-
-@dataclass
-class PremiumAPIConfig:
-    """Premium API tier configuration."""
-    enabled: bool = False
-    providers: List[PremiumProviderEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -67,7 +41,6 @@ class FunctionCallingConfig:
 
 @dataclass
 class TestingConfig:
-    """Background provider testing configuration."""
     enabled: bool = True
     background_worker: bool = True
     scan_interval_minutes: int = 5
@@ -86,16 +59,13 @@ class TestingConfig:
 
 @dataclass
 class RoutingConfig:
-    """Routing behaviour configuration."""
     g4f_max_fallbacks: int = 5
     prefer_fc_score_above: int = 60
 
 
 @dataclass
 class TokenManagementConfig:
-    """Simplified token management."""
     smart_truncation: bool = True
-    premium_enforce_limit: bool = True
     g4f_sliding_window: int = 30
 
 
@@ -116,17 +86,13 @@ class StorageConfig:
 @dataclass
 class UpdaterConfig:
     auto_update_enabled: bool = False
-    check_interval_hours: int = 48
+    check_interval_hours: int = 6
     auto_rescan_after_update: bool = True
 
-# ═══════════════════════════════════════════════════════════════
-# Root Config
-# ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
-    premium_api: PremiumAPIConfig = field(default_factory=PremiumAPIConfig)
     g4f: G4FConfig = field(default_factory=G4FConfig)
     function_calling: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
     testing: TestingConfig = field(default_factory=TestingConfig)
@@ -139,42 +105,24 @@ class Config:
     def to_dict(self) -> Dict[str, Any]:
         d = {}
         for section_name in (
-            "server", "premium_api", "g4f", "function_calling",
+            "server", "g4f", "function_calling",
             "testing", "routing", "token_management",
-            "circuit_breaker", "storage",
-            "updater",
+            "circuit_breaker", "storage", "updater",
         ):
-            val = getattr(self, section_name)
-            if section_name == "premium_api":
-                d[section_name] = {
-                    "enabled": val.enabled,
-                    "providers": [asdict(p) for p in val.providers],
-                }
-            elif section_name == "testing":
-                d[section_name] = asdict(val)
-            else:
-                d[section_name] = asdict(val)
+            d[section_name] = asdict(getattr(self, section_name))
         return d
 
     def to_safe_dict(self) -> Dict[str, Any]:
-        """to_dict but with API keys masked."""
         d = self.to_dict()
-        # Mask server key
         k = d.get("server", {}).get("api_key", "")
         if len(k) > 8:
             d["server"]["api_key"] = k[:4] + "..." + k[-4:]
-        # Mask premium keys
-        for p in d.get("premium_api", {}).get("providers", []):
-            k = p.get("api_key", "")
-            if len(k) > 8:
-                p["api_key"] = k[:4] + "..." + k[-4:]
         return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
         cfg = cls()
 
-        # Simple sections (auto-merge)
         simple_sections = [
             ("server", ServerConfig),
             ("g4f", G4FConfig),
@@ -201,33 +149,8 @@ class Config:
                 except TypeError:
                     pass
 
-        # Premium API (needs special handling for nested list)
-        premium_data = data.get("premium_api", {})
-        if isinstance(premium_data, dict):
-            cfg.premium_api = PremiumAPIConfig(
-                enabled=premium_data.get("enabled", False),
-                providers=[],
-            )
-            for p in premium_data.get("providers", []):
-                if isinstance(p, dict):
-                    valid = {
-                        f.name
-                        for f in PremiumProviderEntry.__dataclass_fields__.values()
-                    }
-                    filtered = {k: v for k, v in p.items() if k in valid}
-                    try:
-                        cfg.premium_api.providers.append(
-                            PremiumProviderEntry(**filtered)
-                        )
-                    except TypeError:
-                        pass
-
         return cfg
 
-
-# ═══════════════════════════════════════════════════════════════
-# ConfigManager (unchanged logic, updated Config)
-# ═══════════════════════════════════════════════════════════════
 
 class ConfigManager:
     def __init__(self, config_path: Optional[Path] = None) -> None:
