@@ -113,6 +113,12 @@ class StorageConfig:
     max_database_size_mb: int = 50
 
 
+@dataclass
+class UpdaterConfig:
+    auto_update_enabled: bool = False
+    check_interval_hours: int = 48
+    auto_rescan_after_update: bool = True
+
 # ═══════════════════════════════════════════════════════════════
 # Root Config
 # ═══════════════════════════════════════════════════════════════
@@ -128,6 +134,7 @@ class Config:
     token_management: TokenManagementConfig = field(default_factory=TokenManagementConfig)
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    updater: UpdaterConfig = field(default_factory=UpdaterConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         d = {}
@@ -135,6 +142,7 @@ class Config:
             "server", "premium_api", "g4f", "function_calling",
             "testing", "routing", "token_management",
             "circuit_breaker", "storage",
+            "updater",
         ):
             val = getattr(self, section_name)
             if section_name == "premium_api":
@@ -176,6 +184,7 @@ class Config:
             ("token_management", TokenManagementConfig),
             ("circuit_breaker", CircuitBreakerConfig),
             ("storage", StorageConfig),
+            ("updater", UpdaterConfig),
         ]
 
         for section_name, section_cls in simple_sections:
