@@ -1,5 +1,5 @@
 """
-Smart router v3 — g4f only, test-result-based ranking, request ID.
+Smart router v4 — Only uses tested & working providers.
 """
 
 import time
@@ -15,14 +15,13 @@ class RoutingResult:
     response: Any = None
     provider_name: str = ""
     model_used: str = ""
-    tier: str = "g4f"
     error: Optional[str] = None
     response_time: float = 0.0
     attempts: int = 0
 
 
 class ProviderRouter:
-    """Routes requests to g4f providers with test-based ranking."""
+    """Routes requests ONLY to tested & working providers."""
 
     def __init__(self) -> None:
         from config import get_config
@@ -33,6 +32,7 @@ class ProviderRouter:
         self.timeout = cfg.g4f.timeout_seconds
         self.max_retries = cfg.g4f.max_retries_per_provider
         self.max_fallbacks = cfg.routing.g4f_max_fallbacks
+        self.only_tested = cfg.routing.only_use_tested
 
     async def route(
         self,
@@ -42,98 +42,50 @@ class ProviderRouter:
         request_id: str = "",
         **kwargs: Any,
     ) -> RoutingResult:
-        """Main routing — strip prefix then route to g4f."""
+        """Route to working providers only."""
 
         # Strip prefix: "openai/gpt-4o" → "gpt-4o"
         if "/" in model and model != "auto":
             model = model.split("/", 1)[-1]
 
-        return await self._route_g4f(
-            model, messages, stream, request_id, **kwargs
-        )
-
-    async def _route_g4f(
-        self,
-        model: str,
-        messages: List[Dict[str, str]],
-        stream: bool,
-        request_id: str,
-        **kwargs: Any,
-    ) -> RoutingResult:
-        """Route to g4f providers using test-result ranking."""
+        from test_worker import get_test_worker
         from scanner import get_scanner
         from resilience import get_resilience
-        from test_worker import get_test_worker
 
+        test_worker = get_test_worker()
         scanner = get_scanner()
         resilience = get_resilience()
-        test_worker = get_test_worker()
 
         need_fc = bool(kwargs.get("_has_tools", False))
 
-        # Get test-ranked providers first
-        ranked = test_worker.get_ranked_providers(model, need_fc=need_fc)
+        # Get ONLY working providers
+        working = test_worker.get_working_providers(model, need_fc=need_fc)
 
-        # Build ordered provider list
-        ordered_providers = []
-        seen = set()
-
-        # Add test-ranked providers
-        for pname, pmodel, fc_score in ranked:
-            pinfo = scanner.providers.get(pname)
-            if pinfo and pname not in seen:
-                ordered_providers.append((pinfo, pmodel))
-                seen.add(pname)
-
-        # Add remaining from scanner (not yet ranked)
-        scanner_providers = scanner.get_providers_for_model(
-            model, streaming=stream
-        )
-        for pinfo in scanner_providers:
-            if pinfo.name not in seen:
-                ordered_providers.append((pinfo, model))
-                seen.add(pinfo.name)
-
-        # If nothing found, try "auto"
-        if not ordered_providers and model != "auto":
+        if not working and model != "auto":
             self.logger.warning(
-                f"[{request_id}] No providers for '{model}', trying auto"
+                f"[{request_id}] No working providers for '{model}', "
+                f"trying auto"
             )
-            auto_ranked = test_worker.get_ranked_providers(
-                "auto", need_fc=need_fc
-            )
-            for pname, pmodel, _ in auto_ranked:
-                pinfo = scanner.providers.get(pname)
-                if pinfo and pname not in seen:
-                    ordered_providers.append((pinfo, pmodel))
-                    seen.add(pname)
-                    break
+            working = test_worker.get_working_providers("auto", need_fc=need_fc)
 
-            auto_scanner = scanner.get_providers_for_model(
-                "auto", streaming=stream
-            )
-            for pinfo in auto_scanner:
-                if pinfo.name not in seen:
-                    ordered_providers.append((pinfo, model))
-                    seen.add(pinfo.name)
-
-        if not ordered_providers:
+        if not working:
             return RoutingResult(
                 success=False,
-                error=f"No providers available for model: {model}",
+                error=f"No working providers for model: {model}. Run /scan first.",
             )
 
         self.logger.info(
-            f"[{request_id}] g4f routing: "
-            f"{len(ordered_providers)} candidates"
+            f"[{request_id}] Routing → {len(working)} working providers"
         )
 
-        # Try providers with fallback
+        # Try providers
         attempts = 0
         last_error = ""
 
-        for pinfo, target_model in ordered_providers[:self.max_fallbacks]:
-            pname = pinfo.name
+        for pname, pmodel, fc_score in working[:self.max_fallbacks]:
+            pinfo = scanner.providers.get(pname)
+            if not pinfo:
+                continue
 
             available, reason = resilience.is_provider_available(pname)
             if not available:
@@ -148,89 +100,66 @@ class ProviderRouter:
 
             for retry in range(self.max_retries):
                 attempts += 1
-                actual_model = self._pick_model(
-                    pinfo, target_model, scanner
-                )
 
                 try:
                     t0 = time.time()
 
                     if stream:
                         gen = await self._call_stream(
-                            pinfo, actual_model, messages, **kwargs
+                            pinfo, pmodel, messages, **kwargs
                         )
                         elapsed = time.time() - t0
 
-                        scanner.update_provider_status(
-                            pname, True, elapsed
-                        )
-                        resilience.get_circuit_breaker(
-                            pname
-                        ).record_success()
+                        scanner.update_provider_status(pname, True, elapsed)
+                        resilience.get_circuit_breaker(pname).record_success()
 
                         return RoutingResult(
                             success=True, response=gen,
                             provider_name=pname,
-                            model_used=actual_model,
+                            model_used=pmodel,
                             response_time=elapsed,
                             attempts=attempts,
                         )
                     else:
                         text = await self._call_sync(
-                            pinfo, actual_model, messages, **kwargs
+                            pinfo, pmodel, messages, **kwargs
                         )
                         elapsed = time.time() - t0
 
                         if not text or not text.strip():
                             raise ValueError("Empty response")
 
-                        scanner.update_provider_status(
-                            pname, True, elapsed
-                        )
-                        resilience.get_circuit_breaker(
-                            pname
-                        ).record_success()
+                        scanner.update_provider_status(pname, True, elapsed)
+                        resilience.get_circuit_breaker(pname).record_success()
 
                         self.logger.info(
-                            f"[{request_id}] ← tier=g4f "
-                            f"provider={pname} "
-                            f"model={actual_model} "
+                            f"[{request_id}] ← provider={pname} "
+                            f"model={pmodel} fc_score={fc_score} "
                             f"time={elapsed:.1f}s"
                         )
 
                         return RoutingResult(
                             success=True, response=text,
                             provider_name=pname,
-                            model_used=actual_model,
+                            model_used=pmodel,
                             response_time=elapsed,
                             attempts=attempts,
                         )
 
                 except Exception as e:
-                    last_error = str(e)
+                    last_error = str(e)[:100]
                     self.logger.warning(
-                        f"[{request_id}] provider={pname} "
-                        f"failed: {last_error[:80]} | "
-                        f"fallback=next"
+                        f"[{request_id}] {pname} failed: {last_error}"
                     )
-                    scanner.update_provider_status(
-                        pname, False, error=last_error
-                    )
-                    cb = resilience.get_circuit_breaker(pname)
-                    cb.record_failure()
-
-                    if not cb.is_available():
-                        break
+                    scanner.update_provider_status(pname, False, error=last_error)
+                    resilience.get_circuit_breaker(pname).record_failure()
 
                     if retry < self.max_retries - 1:
-                        await asyncio.sleep(min(2 ** retry, 10))
+                        await asyncio.sleep(min(2 ** retry, 5))
 
         return RoutingResult(
             success=False,
-            error=(
-                f"All g4f providers failed "
-                f"({attempts} attempts): {last_error}"
-            ),
+            error=f"All providers failed ({attempts} attempts): {last_error}",
             attempts=attempts,
         )
 
@@ -238,9 +167,8 @@ class ProviderRouter:
         self, pinfo: Any, model: str,
         messages: List[Dict[str, str]], **kwargs: Any,
     ) -> str:
-        import g4f  # type: ignore
+        import g4f
 
-        loop = asyncio.get_event_loop()
         g4f_kwargs = {
             k: v for k, v in kwargs.items()
             if k in ("temperature", "max_tokens", "top_p")
@@ -260,6 +188,8 @@ class ProviderRouter:
         except (AttributeError, TypeError):
             pass
 
+        loop = asyncio.get_event_loop()
+
         def _sync() -> str:
             return str(g4f.ChatCompletion.create(
                 model=model,
@@ -277,7 +207,7 @@ class ProviderRouter:
         self, pinfo: Any, model: str,
         messages: List[Dict[str, str]], **kwargs: Any,
     ) -> AsyncGenerator[str, None]:
-        import g4f  # type: ignore
+        import g4f
 
         g4f_kwargs = {
             k: v for k, v in kwargs.items()
@@ -314,15 +244,6 @@ class ProviderRouter:
                 except StopIteration:
                     break
         return _wrap()
-
-    @staticmethod
-    def _pick_model(pinfo: Any, requested: str, scanner: Any) -> str:
-        if requested in pinfo.models:
-            return requested
-        for supported in pinfo.models:
-            if scanner.model_matches(supported, requested):
-                return supported
-        return pinfo.models[0] if pinfo.models else requested
 
 
 _router: Optional[ProviderRouter] = None

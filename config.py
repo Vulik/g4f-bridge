@@ -1,10 +1,9 @@
 """
 Configuration management module.
-v3: With Testing, Routing, Updater config. Simple API key.
+v4: Simplified testing - startup only + 24h interval.
 """
 
 import json
-import secrets
 import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -36,36 +35,29 @@ class FunctionCallingConfig:
     enabled: bool = True
     max_parse_retries: int = 2
     fallback_to_text: bool = True
-    log_injected_prompt: bool = False
 
 
 @dataclass
 class TestingConfig:
+    """Testing config — startup + 24h interval."""
     enabled: bool = True
-    background_worker: bool = True
-    scan_interval_minutes: int = 5
+    test_on_startup: bool = True
+    startup_timeout_minutes: int = 10
+    retest_interval_hours: int = 24
     test_timeout_seconds: int = 30
-    sequential_delay_seconds: int = 3
-    max_dead_streak: int = 3
-    retest_intervals_minutes: Dict[str, int] = field(default_factory=lambda: {
-        "active": 360,
-        "fc_capable": 360,
-        "chat_only": 720,
-        "unstable": 30,
-        "dead": 1440,
-        "untested": 0,
-    })
+    sequential_delay_seconds: int = 2
+    min_fc_score: int = 40
 
 
 @dataclass
 class RoutingConfig:
     g4f_max_fallbacks: int = 5
-    prefer_fc_score_above: int = 60
+    only_use_tested: bool = True
+    prefer_fc_score_above: int = 50
 
 
 @dataclass
 class TokenManagementConfig:
-    smart_truncation: bool = True
     g4f_sliding_window: int = 30
 
 
@@ -73,7 +65,7 @@ class TokenManagementConfig:
 class CircuitBreakerConfig:
     failure_threshold: int = 3
     cooldown_seconds: int = 600
-    rate_limit_per_minute: int = 5
+    rate_limit_per_minute: int = 10
     half_open_max_calls: int = 1
 
 
@@ -86,7 +78,7 @@ class StorageConfig:
 @dataclass
 class UpdaterConfig:
     auto_update_enabled: bool = False
-    check_interval_hours: int = 6
+    check_interval_hours: int = 24
     auto_rescan_after_update: bool = True
 
 
