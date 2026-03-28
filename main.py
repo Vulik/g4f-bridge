@@ -641,4 +641,141 @@ if USE_FASTAPI:
 
     @app.get("/config")
     async def get_current_config(
-        authorization: Optional[str] 
+        authorization: Optional[str] = Header(None),
+    ) -> Any:
+        if not _verify_key(authorization):
+            return JSONResponse(
+                status_code=401,
+                content=build_error("Unauthorized", "authentication_error"),
+            )
+        return config.to_safe_dict()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Flask Fallback
+# ═══════════════════════════════════════════════════════════════
+
+else:
+    from flask import Flask, request as flask_request, jsonify
+
+    app = Flask(__name__)
+
+    def _flask_auth() -> bool:
+        return _verify_key(flask_request.headers.get("Authorization"))
+
+    @app.before_first_request
+    def _flask_startup() -> None:
+        get_scanner().scan()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(get_test_worker().run_startup_test())
+        finally:
+            loop.close()
+
+    @app.route("/v1/chat/completions", methods=["POST"])
+    def flask_chat() -> Any:
+        request_id = _gen_request_id()
+
+        if not _flask_auth():
+            return jsonify(
+                build_error("Invalid API key", "authentication_error")
+            ), 401
+
+        body = flask_request.get_json(silent=True) or {}
+
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                handle_chat_request(body, request_id)
+            )
+        finally:
+            loop.close()
+
+        if isinstance(result, dict) and result.get("__stream__"):
+            return jsonify(
+                build_error("Streaming requires FastAPI", "invalid_request_error")
+            ), 400
+
+        if "error" in result:
+            status = (
+                400 if result["error"].get("type") == "invalid_request_error"
+                else 502
+            )
+            return jsonify(result), status
+
+        resp = jsonify(ensure_openai_format(result))
+        resp.headers["X-Request-ID"] = request_id
+        return resp
+
+    @app.route("/v1/models", methods=["GET"])
+    def flask_models() -> Any:
+        if not _flask_auth():
+            return jsonify(
+                build_error("Invalid API key", "authentication_error")
+            ), 401
+        working_models = get_test_worker().get_working_models()
+        return jsonify(build_models_list(working_models))
+
+    @app.route("/health", methods=["GET"])
+    def flask_health() -> Any:
+        summary = get_test_worker().get_summary()
+        return jsonify({
+            "status": "healthy" if summary["working"] > 0 else "degraded",
+            "version": BRIDGE_VERSION,
+            "providers": summary,
+        })
+
+    @app.route("/api-key", methods=["GET"])
+    def flask_api_key() -> Any:
+        remote = flask_request.remote_addr
+        if remote not in ("127.0.0.1", "::1"):
+            return jsonify(build_error("Forbidden")), 403
+        return jsonify({"api_key": config.server.api_key})
+
+
+# ═══════════════════════════════════════════════════════════════
+# Entry Point
+# ═══════════════════════════════════════════════════════════════
+
+def handle_signal(signum: int, frame: Any) -> None:
+    logger.info(f"Signal {signum}, shutting down...")
+    save_config()
+    sys.exit(0)
+
+
+def print_banner() -> None:
+    print()
+    print("╔════════════════════════════════════════════════════════════╗")
+    print(f"║  g4f-Bridge v{BRIDGE_VERSION}                                      ║")
+    print("╠════════════════════════════════════════════════════════════╣")
+    print(f"║  Server:  http://{config.server.host}:{config.server.port}                          ║")
+    print(f"║  API Key: {config.server.api_key:<42} ║")
+    print("╠════════════════════════════════════════════════════════════╣")
+    print("║  PicoClaw config:                                          ║")
+    print(f"║    api_base = http://localhost:{config.server.port}/v1                   ║")
+    print(f"║    api_key  = {config.server.api_key:<42} ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print()
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    print_banner()
+
+    if USE_FASTAPI:
+        uvicorn.run(
+            app, host=config.server.host, port=config.server.port,
+            log_level="warning", access_log=False,
+        )
+    else:
+        app.run(
+            host=config.server.host, port=config.server.port,
+            debug=False, threaded=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
