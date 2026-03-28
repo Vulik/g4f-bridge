@@ -1,6 +1,5 @@
 """
 Premium API adapter — connects to OpenAI-compatible paid APIs.
-Supports native function calling, streaming, and error handling.
 """
 
 import time
@@ -22,10 +21,7 @@ class PremiumResult:
 
 
 class PremiumAdapter:
-    """
-    Handles connections to premium (paid) OpenAI-compatible APIs.
-    Uses httpx for async HTTP calls — no extra SDK required.
-    """
+    """Handles connections to premium (paid) OpenAI-compatible APIs."""
 
     def __init__(self) -> None:
         from config import get_config
@@ -33,53 +29,45 @@ class PremiumAdapter:
         self.logger = get_logger("premium")
         self.config = get_config()
 
-    # ── Provider Lookup ───────────────────────────────────
+    def is_enabled(self) -> bool:
+        """Check if premium API is enabled and has providers."""
+        if not self.config.premium_api.enabled:
+            return False
+        return any(
+            p.get("enabled", False) and p.get("api_key")
+            for p in self.config.premium_api.providers
+        )
 
     def find_provider_for_model(
         self, model: str
-    ) -> Tuple[Optional[Any], str]:
-        """
-        Find a premium provider that supports the requested model.
-
-        Returns:
-            (PremiumProviderEntry or None, actual_model_name)
-        """
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Find a premium provider that supports the requested model."""
         if not self.config.premium_api.enabled:
             return None, model
 
         for entry in self.config.premium_api.providers:
-            if not entry.enabled or not entry.api_key:
+            if not entry.get("enabled", False) or not entry.get("api_key"):
                 continue
+
+            models = entry.get("models", [])
 
             if model == "auto":
-                if entry.models:
-                    return entry, entry.models[0]
+                if models:
+                    return entry, models[0]
                 continue
 
-            if model in entry.models:
+            if model in models:
                 return entry, model
 
-            # Fuzzy: check if model is a substring
-            for m in entry.models:
+            for m in models:
                 if model.lower() in m.lower() or m.lower() in model.lower():
                     return entry, m
 
         return None, model
 
-    def has_any_provider(self) -> bool:
-        """Check if any premium provider is configured and enabled."""
-        if not self.config.premium_api.enabled:
-            return False
-        return any(
-            p.enabled and p.api_key
-            for p in self.config.premium_api.providers
-        )
-
-    # ── API Call (non-streaming) ──────────────────────────
-
     async def call(
         self,
-        provider: Any,
+        provider: Dict[str, Any],
         model: str,
         messages: List[Dict[str, str]],
         tools: Optional[List[Dict]] = None,
@@ -88,11 +76,15 @@ class PremiumAdapter:
         max_tokens: int = 4096,
         request_id: str = "",
     ) -> PremiumResult:
-        """
-        Call premium API (non-streaming).
-        Returns full OpenAI-format response dict.
-        """
-        import httpx
+        """Call premium API (non-streaming)."""
+        try:
+            import httpx
+        except ImportError:
+            return PremiumResult(
+                success=False,
+                provider_name=provider.get("name", ""),
+                error="httpx not installed. Run: pip install httpx",
+            )
 
         body: Dict[str, Any] = {
             "model": model,
@@ -106,23 +98,23 @@ class PremiumAdapter:
             body["tools"] = tools
             body["tool_choice"] = tool_choice
 
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        base_url = provider.get("base_url", "").rstrip("/")
+        url = f"{base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {provider.api_key}",
+            "Authorization": f"Bearer {provider.get('api_key', '')}",
             "Content-Type": "application/json",
         }
 
-        masked = self._mask_key(provider.api_key)
-        self.logger.debug(
-            f"[{request_id}] Premium → {provider.name} "
-            f"model={model} key={masked}"
-        )
+        timeout_sec = provider.get("timeout", 60)
+        pname = provider.get("name", "premium")
+
+        self.logger.debug(f"[{request_id}] Premium → {pname} model={model}")
 
         t0 = time.time()
 
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(provider.timeout, connect=10)
+                timeout=httpx.Timeout(timeout_sec, connect=10)
             ) as client:
                 resp = await client.post(url, json=body, headers=headers)
 
@@ -131,12 +123,11 @@ class PremiumAdapter:
             if resp.status_code != 200:
                 error_text = resp.text[:300]
                 self.logger.warning(
-                    f"[{request_id}] Premium {provider.name} "
-                    f"HTTP {resp.status_code}: {error_text}"
+                    f"[{request_id}] Premium {pname} HTTP {resp.status_code}"
                 )
                 return PremiumResult(
                     success=False,
-                    provider_name=provider.name,
+                    provider_name=pname,
                     model_used=model,
                     error=f"HTTP {resp.status_code}: {error_text}",
                     response_time=elapsed,
@@ -145,40 +136,31 @@ class PremiumAdapter:
             data = resp.json()
 
             self.logger.info(
-                f"[{request_id}] ← tier=premium provider={provider.name} "
+                f"[{request_id}] ← tier=premium provider={pname} "
                 f"model={model} time={elapsed:.1f}s"
             )
 
             return PremiumResult(
                 success=True,
                 response=data,
-                provider_name=provider.name,
+                provider_name=pname,
                 model_used=model,
                 response_time=elapsed,
             )
 
-        except httpx.TimeoutException:
-            elapsed = time.time() - t0
-            return PremiumResult(
-                success=False,
-                provider_name=provider.name,
-                error=f"Timeout after {elapsed:.1f}s",
-                response_time=elapsed,
-            )
         except Exception as e:
             elapsed = time.time() - t0
+            self.logger.warning(f"[{request_id}] Premium {pname} error: {e}")
             return PremiumResult(
                 success=False,
-                provider_name=provider.name,
+                provider_name=pname,
                 error=str(e)[:200],
                 response_time=elapsed,
             )
 
-    # ── API Call (streaming) ──────────────────────────────
-
     async def call_stream(
         self,
-        provider: Any,
+        provider: Dict[str, Any],
         model: str,
         messages: List[Dict[str, str]],
         tools: Optional[List[Dict]] = None,
@@ -187,11 +169,12 @@ class PremiumAdapter:
         max_tokens: int = 4096,
         request_id: str = "",
     ) -> AsyncGenerator[str, None]:
-        """
-        Call premium API with streaming.
-        Yields raw SSE lines (proxied from upstream).
-        """
-        import httpx
+        """Call premium API with streaming."""
+        try:
+            import httpx
+        except ImportError:
+            yield 'data: {"error": "httpx not installed"}\n\n'
+            return
 
         body: Dict[str, Any] = {
             "model": model,
@@ -205,31 +188,32 @@ class PremiumAdapter:
             body["tools"] = tools
             body["tool_choice"] = tool_choice
 
-        url = f"{provider.base_url.rstrip('/')}/chat/completions"
+        base_url = provider.get("base_url", "").rstrip("/")
+        url = f"{base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {provider.api_key}",
+            "Authorization": f"Bearer {provider.get('api_key', '')}",
             "Content-Type": "application/json",
         }
 
-        self.logger.info(
-            f"[{request_id}] Premium stream → {provider.name} model={model}"
-        )
+        timeout_sec = provider.get("timeout", 60)
+        pname = provider.get("name", "premium")
+
+        self.logger.info(f"[{request_id}] Premium stream → {pname} model={model}")
 
         client = httpx.AsyncClient(
-            timeout=httpx.Timeout(provider.timeout, connect=10)
+            timeout=httpx.Timeout(timeout_sec, connect=10)
         )
 
         try:
-            async with client.stream(
-                "POST", url, json=body, headers=headers
-            ) as resp:
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     text = ""
                     async for chunk in resp.aiter_text():
                         text += chunk
                         if len(text) > 300:
                             break
-                    raise Exception(f"HTTP {resp.status_code}: {text[:300]}")
+                    yield f'data: {{"error": "HTTP {resp.status_code}"}}\n\n'
+                    return
 
                 async for line in resp.aiter_lines():
                     stripped = line.strip()
@@ -238,31 +222,12 @@ class PremiumAdapter:
         finally:
             await client.aclose()
 
-    # ── Helpers ───────────────────────────────────────────
 
-    @staticmethod
-    def _mask_key(key: str) -> str:
-        if not key:
-            return "****"
-        if len(key) > 8:
-            return key[:4] + "..." + key[-4:]
-        return "****"
-
-
-# ═══════════════════════════════════════════════════════════════
-# Global singleton
-# ═══════════════════════════════════════════════════════════════
-
-import threading
-
-_adapter_lock = threading.Lock()
 _adapter: Optional[PremiumAdapter] = None
 
 
 def get_premium_adapter() -> PremiumAdapter:
     global _adapter
     if _adapter is None:
-        with _adapter_lock:
-            if _adapter is None:
-                _adapter = PremiumAdapter()
+        _adapter = PremiumAdapter()
     return _adapter

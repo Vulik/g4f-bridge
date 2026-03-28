@@ -2,7 +2,7 @@
 Provider Test Worker v2.
 - Tests on startup (blocking)
 - Retests every 24 hours (background)
-- Only exposes working provider-model combinations
+- Auto-save every 10 tests
 """
 
 import json
@@ -18,7 +18,6 @@ from logger_setup import get_logger
 
 @dataclass
 class TestResult:
-    """Test result for one provider+model combination."""
     provider: str = ""
     model: str = ""
     status: str = "untested"
@@ -32,15 +31,11 @@ class TestResult:
     tested_at: Optional[str] = None
 
 
-# ═══════════════════════════════════════════════════════════════
-# Test Messages
-# ═══════════════════════════════════════════════════════════════
-
 _CHAT_MSG = [{"role": "user", "content": "Reply with exactly: OK"}]
 
 _FC_SYSTEM = """You are a JSON-only assistant. Output ONLY valid JSON.
-To call a function: {"tool_calls":[{"name":"get_weather","arguments":{"location":"Tokyo"}}]}
-NO text. NO markdown. ONLY the JSON object."""
+Format: {"tool_calls":[{"function":{"name":"get_weather","arguments":{"location":"Tokyo"}}}]}
+NO text. NO markdown. ONLY JSON."""
 
 _FC_MSG = [
     {"role": "system", "content": _FC_SYSTEM},
@@ -58,15 +53,6 @@ _TOOL_RESULT_MSG = [
 
 
 class ProviderTestWorker:
-    """
-    Tests g4f providers and maintains list of working combinations.
-
-    Features:
-    - Blocking test on startup
-    - Background retest every 24 hours
-    - Only exposes working providers to router
-    """
-
     def __init__(self) -> None:
         from config import get_config
         from environment import get_environment
@@ -85,14 +71,9 @@ class ProviderTestWorker:
         self._task: Optional[asyncio.Task] = None
         self._lock = threading.Lock()
 
-    # ══════════════════════════════════════════════════════
-    # Persistence
-    # ══════════════════════════════════════════════════════
-
     def load_results(self) -> bool:
-        """Load previous results. Returns True if valid cache exists."""
         if not self.results_file.exists():
-            self.logger.info("No cached test results found")
+            self.logger.info("No cached test results")
             return False
 
         try:
@@ -108,13 +89,11 @@ class ProviderTestWorker:
                 except (ValueError, TypeError):
                     pass
 
-            # Check if cache is still valid (within 24 hours)
             if self.tested_at:
                 age = datetime.utcnow() - self.tested_at
                 max_age = timedelta(hours=self.test_cfg.retest_interval_hours)
 
                 if age < max_age:
-                    # Load from cache
                     tests = data.get("tests", {})
                     for key, entry in tests.items():
                         valid = {
@@ -128,9 +107,8 @@ class ProviderTestWorker:
 
                     self._update_working_set()
                     self.logger.info(
-                        f"✓ Loaded {len(self.working_combinations)} "
-                        f"working combinations from cache "
-                        f"(age: {age.total_seconds() / 3600:.1f}h)"
+                        f"✓ Loaded {len(self.working_combinations)} working "
+                        f"(cache age: {age.total_seconds() / 3600:.1f}h)"
                     )
                     return True
 
@@ -142,7 +120,6 @@ class ProviderTestWorker:
             return False
 
     def save_results(self) -> None:
-        """Save results to JSON file."""
         with self._lock:
             working = [
                 k for k, r in self.results.items()
@@ -163,39 +140,26 @@ class ProviderTestWorker:
             self.results_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.results_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, default=str)
-            self.logger.info(f"Saved {len(working)} working combinations")
         except Exception as e:
             self.logger.error(f"Failed to save: {e}")
 
     def _update_working_set(self) -> None:
-        """Update the set of working combinations."""
         with self._lock:
             self.working_combinations.clear()
             for key, r in self.results.items():
                 if r.status in ("active", "fc_capable", "chat_only"):
                     self.working_combinations.add(key)
 
-    # ══════════════════════════════════════════════════════
-    # Startup Test (Blocking)
-    # ══════════════════════════════════════════════════════
-
     async def run_startup_test(self) -> int:
-        """
-        Run tests on startup. BLOCKING until complete.
-        Returns number of working combinations.
-        """
         if not self.test_cfg.enabled:
             self.logger.info("Testing disabled")
             return 0
 
-        # Try loading cache first
         if self.load_results() and self.working_combinations:
             return len(self.working_combinations)
 
-        # Need to run full test
         self.logger.info("=" * 50)
         self.logger.info("  STARTING PROVIDER TESTS")
-        self.logger.info("  This may take a few minutes...")
         self.logger.info("=" * 50)
 
         await self._run_full_test()
@@ -206,12 +170,11 @@ class ProviderTestWorker:
         if count == 0:
             self.logger.error("⚠ NO WORKING PROVIDERS FOUND!")
         else:
-            self.logger.info(f"✓ Found {count} working combinations")
+            self.logger.info(f"✓ {count} working combinations")
 
         return count
 
     async def _run_full_test(self) -> None:
-        """Test all provider+model combinations."""
         from scanner import get_scanner
 
         scanner = get_scanner()
@@ -219,7 +182,7 @@ class ProviderTestWorker:
             scanner.scan()
 
         if not scanner.providers:
-            self.logger.error("No g4f providers available!")
+            self.logger.error("No g4f providers!")
             return
 
         combinations = []
@@ -237,9 +200,7 @@ class ProviderTestWorker:
             tested += 1
             key = f"{pname}::{model}"
 
-            self.logger.info(
-                f"  [{tested}/{total}] {pname} :: {model}"
-            )
+            self.logger.info(f"  [{tested}/{total}] {pname} :: {model}")
 
             result = await self._test_single(pinfo, model)
             result.provider = pname
@@ -249,35 +210,29 @@ class ProviderTestWorker:
             with self._lock:
                 self.results[key] = result
 
-            status_icon = {
-                "active": "✅",
-                "fc_capable": "🔧",
-                "chat_only": "💬",
-                "dead": "❌",
+            icon = {
+                "active": "✅", "fc_capable": "🔧",
+                "chat_only": "💬", "dead": "❌",
             }.get(result.status, "❓")
 
-            self.logger.info(
-                f"      {status_icon} {result.status} "
-                f"(fc_score={result.fc_score})"
-            )
+            self.logger.info(f"      {icon} {result.status} (fc={result.fc_score})")
+
+            if tested % 10 == 0:
+                self._update_working_set()
+                self.save_results()
+                self.logger.info(f"  💾 Auto-saved ({tested}/{total})")
 
             await asyncio.sleep(self.test_cfg.sequential_delay_seconds)
 
         self.tested_at = datetime.utcnow()
 
-    async def _test_single(
-        self, pinfo: Any, model: str
-    ) -> TestResult:
-        """Test a single provider+model."""
+    async def _test_single(self, pinfo: Any, model: str) -> TestResult:
         result = TestResult()
         timeout = self.test_cfg.test_timeout_seconds
 
-        # ── Chat Test ──
         try:
             t0 = time.time()
-            response = await self._call_g4f(
-                pinfo, model, _CHAT_MSG, timeout
-            )
+            response = await self._call_g4f(pinfo, model, _CHAT_MSG, timeout)
             elapsed = int((time.time() - t0) * 1000)
 
             if response and response.strip():
@@ -293,26 +248,19 @@ class ProviderTestWorker:
             result.status = "dead"
             return result
 
-        # ── FC Test ──
         try:
             t0 = time.time()
-            response = await self._call_g4f(
-                pinfo, model, _FC_MSG, timeout
-            )
+            response = await self._call_g4f(pinfo, model, _FC_MSG, timeout)
             elapsed = int((time.time() - t0) * 1000)
 
             if response:
                 result.fc_time_ms = elapsed
                 result.fc_score = self._calc_fc_score(response)
-                result.fc_ok = (
-                    result.fc_score >= self.test_cfg.min_fc_score
-                )
+                result.fc_ok = result.fc_score >= self.test_cfg.min_fc_score
 
-        except Exception as e:
+        except Exception:
             result.fc_ok = False
-            result.fc_score = 0
 
-        # ── Tool Result Test (only if FC passed) ──
         if result.fc_ok:
             try:
                 response = await self._call_g4f(
@@ -323,7 +271,6 @@ class ProviderTestWorker:
             except Exception:
                 pass
 
-        # ── Determine Status ──
         if result.chat_ok and result.fc_ok and result.tool_result_ok:
             result.status = "active"
         elif result.chat_ok and result.fc_ok:
@@ -339,8 +286,7 @@ class ProviderTestWorker:
         self, pinfo: Any, model: str,
         messages: List[Dict], timeout: int,
     ) -> str:
-        """Call g4f provider directly."""
-        import g4f  # type: ignore
+        import g4f
 
         try:
             result = await asyncio.wait_for(
@@ -371,15 +317,12 @@ class ProviderTestWorker:
 
     @staticmethod
     def _calc_fc_score(text: str) -> int:
-        """Calculate FC quality score (0-100)."""
         import re
 
         score = 0
         text = text.strip()
-
         parsed = None
 
-        # Pure JSON
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
@@ -387,7 +330,6 @@ class ProviderTestWorker:
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # JSON in code block
         if parsed is None:
             match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
             if match:
@@ -398,7 +340,6 @@ class ProviderTestWorker:
                 except (json.JSONDecodeError, ValueError):
                     pass
 
-        # Bracket extraction
         if parsed is None:
             start = text.find('{')
             if start != -1:
@@ -431,7 +372,6 @@ class ProviderTestWorker:
         if not parsed or not isinstance(parsed, dict):
             return score
 
-        # Check tool_calls
         if "tool_calls" in parsed:
             score += 25
             calls = parsed["tool_calls"]
@@ -441,6 +381,7 @@ class ProviderTestWorker:
                 name = (
                     call.get("name") or
                     call.get("function_name") or
+                    call.get("tool") or
                     (call.get("function", {}).get("name")
                      if isinstance(call.get("function"), dict) else None)
                 )
@@ -465,18 +406,10 @@ class ProviderTestWorker:
 
         return min(score, 100)
 
-    # ══════════════════════════════════════════════════════
-    # Background Scheduler
-    # ══════════════════════════════════════════════════════
-
     async def start_scheduler(self) -> None:
-        """Start background scheduler for 24h retests."""
         self._running = True
         self._task = asyncio.create_task(self._scheduler_loop())
-        self.logger.info(
-            f"Background scheduler started "
-            f"(interval: {self.test_cfg.retest_interval_hours}h)"
-        )
+        self.logger.info(f"Scheduler started ({self.test_cfg.retest_interval_hours}h)")
 
     async def stop(self) -> None:
         self._running = False
@@ -488,12 +421,11 @@ class ProviderTestWorker:
                 pass
 
     async def _scheduler_loop(self) -> None:
-        interval_sec = self.test_cfg.retest_interval_hours * 3600
+        interval = self.test_cfg.retest_interval_hours * 3600
 
         while self._running:
             try:
-                await asyncio.sleep(interval_sec)
-
+                await asyncio.sleep(interval)
                 if not self._running:
                     break
 
@@ -507,22 +439,13 @@ class ProviderTestWorker:
             except Exception as e:
                 self.logger.error(f"Scheduler error: {e}")
 
-    # ══════════════════════════════════════════════════════
-    # Public Query API
-    # ══════════════════════════════════════════════════════
-
     def is_working(self, provider: str, model: str) -> bool:
-        """Check if a provider+model combo is working."""
         key = f"{provider}::{model}"
         return key in self.working_combinations
 
     def get_working_providers(
         self, model: str, need_fc: bool = False
     ) -> List[Tuple[str, str, int]]:
-        """
-        Get working providers for a model.
-        Returns: [(provider_name, model_name, fc_score), ...]
-        """
         candidates = []
 
         with self._lock:
@@ -531,45 +454,34 @@ class ProviderTestWorker:
                 if not result:
                     continue
 
-                # Model matching
                 if model != "auto":
                     if result.model != model:
                         if model.lower() not in result.model.lower():
                             continue
 
-                # FC requirement
                 if need_fc:
                     if result.status == "chat_only":
                         continue
                     if result.fc_score < self.config.testing.min_fc_score:
                         continue
 
-                # Score for ranking
-                rank_score = result.fc_score
-
-                # Bonus for status
+                rank = result.fc_score
                 if result.status == "active":
-                    rank_score += 50
+                    rank += 50
                 elif result.status == "fc_capable":
-                    rank_score += 30
-
-                # Bonus for speed
+                    rank += 30
                 if result.chat_time_ms > 0 and result.chat_time_ms < 3000:
-                    rank_score += 20
+                    rank += 20
 
                 candidates.append((
-                    result.provider,
-                    result.model,
-                    result.fc_score,
-                    rank_score,
+                    result.provider, result.model,
+                    result.fc_score, rank,
                 ))
 
-        # Sort by rank (highest first)
         candidates.sort(key=lambda x: -x[3])
         return [(c[0], c[1], c[2]) for c in candidates]
 
     def get_working_models(self) -> List[str]:
-        """Get list of unique working models."""
         models = set()
         with self._lock:
             for key in self.working_combinations:
@@ -579,9 +491,8 @@ class ProviderTestWorker:
         return sorted(models)
 
     def get_results_dict(self) -> Dict[str, Any]:
-        """Get results for API response."""
         with self._lock:
-            working = [k for k in self.working_combinations]
+            working = list(self.working_combinations)
             return {
                 "version": 3,
                 "tested_at": self.tested_at.isoformat() + "Z" if self.tested_at else None,
@@ -592,17 +503,12 @@ class ProviderTestWorker:
             }
 
     def get_summary(self) -> Dict[str, int]:
-        """Get status summary."""
-        counts = {
-            "active": 0, "fc_capable": 0, "chat_only": 0, "dead": 0,
-        }
+        counts = {"active": 0, "fc_capable": 0, "chat_only": 0, "dead": 0}
         with self._lock:
             for r in self.results.values():
                 if r.status in counts:
                     counts[r.status] += 1
-        counts["working"] = (
-            counts["active"] + counts["fc_capable"] + counts["chat_only"]
-        )
+        counts["working"] = counts["active"] + counts["fc_capable"] + counts["chat_only"]
         counts["total"] = len(self.results)
         return counts
 
@@ -614,10 +520,6 @@ class ProviderTestWorker:
         except ImportError:
             return "not_installed"
 
-
-# ═══════════════════════════════════════════════════════════════
-# Global singleton
-# ═══════════════════════════════════════════════════════════════
 
 _worker_lock = threading.Lock()
 _worker: Optional[ProviderTestWorker] = None
